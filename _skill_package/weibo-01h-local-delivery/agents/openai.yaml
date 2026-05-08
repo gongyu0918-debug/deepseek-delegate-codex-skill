@@ -1,0 +1,4 @@
+interface:
+  display_name: "Weibo 01H Local Delivery"
+  short_description: "Run and calibrate local 01H Weibo digest workflows"
+  default_prompt: "Use -01h-local-delivery for local 01H Weibo digest runs, calibration, DeepSeek ablation, and format-safe rewriting."

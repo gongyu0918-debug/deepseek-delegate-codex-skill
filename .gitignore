@@ -1,0 +1,6 @@
+*
+!/.gitignore
+!/_skill_package/
+!/_skill_package/**
+/_skill_package/deepseek-config/
+!/weibo-hotness-skill-maintenance.md

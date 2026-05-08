@@ -1,0 +1,4 @@
+interface:
+  display_name: "DeepSeek Delegate"
+  short_description: "Stable advisory DeepSeek delegation with structured status"
+  default_prompt: "Use $deepseek-delegate to delegate a bounded task to DeepSeek TUI, inspect the structured result, and verify findings locally."
