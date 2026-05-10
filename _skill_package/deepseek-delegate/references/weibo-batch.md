@@ -13,7 +13,7 @@ Use DeepSeek as a second reviewer for:
 - Finding duplicate same-angle chains and weaker filler items before Codex reruns the local gate.
 
 Do not use it as the final sender, validator, or editor of record.
-For hotness-controlled historical Weibo batches in the 01H workflow, pass `--model deepseek-v4-pro` explicitly through `--packet-profile weibo-calibration`. Other low-risk broad advisory passes may use cheaper models only when the active task does not specify a model.
+For 01H Weibo ablation or calibration batches, use `deepseek-v4-pro`. The helper defaults to Pro; pass `--model` only for an explicit manual compatibility override.
 
 ## Packet Contents
 
@@ -60,6 +60,7 @@ python "$env:USERPROFILE\.codex\skills\deepseek-delegate\scripts\deepseek_delega
   --task "Review this Weibo prepared digest against baseline and gate output. Identify regressions and exact Codex checks. Do not modify files." `
   --context-file .\out\llm-calibration\auto-latest\deepseek_ablation_packet.md `
   --cwd F:\Workspaces\weibo `
+  --structured-result `
   --json-result `
   --out .\out\llm-calibration\auto-latest\deepseek_ablation_review.md
 ```
@@ -70,8 +71,9 @@ python "$env:USERPROFILE\.codex\skills\deepseek-delegate\scripts\deepseek_delega
   --task "Review hotness-controlled historical Weibo pairs. Return one JUDGMENT per Candidate with topic_heat_driven, angle_label, transferable_to_01h, and evidence-bound signals. Do not modify files." `
   --context-file .\out\llm-calibration\auto-latest\deepseek_calibration_packet.md `
   --cwd F:\Workspaces\weibo `
+  --structured-result `
   --json-result `
   --out .\out\llm-calibration\auto-latest\deepseek_calibration_review.md
 ```
 
-With `--json-result`, treat `result.status=ok` and all chunk `headings_ok=true` as evidence that the advisory call completed cleanly. The raw review file remains advisory; local validators remain authoritative.
+With `--structured-result --json-result`, treat `result.status=ok` and all chunk `structured_ok=true` as evidence that the advisory call completed cleanly. The raw review file remains advisory; local validators remain authoritative.

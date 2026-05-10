@@ -30,6 +30,38 @@ REQUIRED_HEADINGS = [
     "Suggested Codex Checks",
 ]
 
+STRUCTURED_RESULT_REQUIRED_FIELDS = (
+    "answer",
+    "findings",
+    "uncertainty",
+    "suggested_codex_checks",
+)
+STRUCTURED_FINDING_REQUIRED_FIELDS = (
+    "severity",
+    "claim",
+    "evidence",
+    "codex_check",
+)
+STRUCTURED_SEVERITY_VALUES = ("low", "medium", "high")
+STRUCTURED_RESULT_SCHEMA = """Return exactly one fenced JSON object and no other sections:
+```json
+{
+  "answer": "Concise packet-local conclusion.",
+  "findings": [
+    {
+      "severity": "low|medium|high",
+      "claim": "Evidence-bound finding.",
+      "evidence": "Packet quote, id, path, log line, or static code path.",
+      "codex_check": "Exact local check Codex should perform."
+    }
+  ],
+  "uncertainty": ["Missing context or assumptions."],
+  "suggested_codex_checks": ["Commands, files, or evidence Codex should verify."]
+}
+```
+Use an empty findings array only when there are no concrete findings.
+"""
+
 
 DRIVER_CHOICES = ("auto", "exec", "mcp")
 MCP_TOOL_NAME_KEYWORDS = ("delegate", "review")
@@ -89,6 +121,7 @@ MODE_GUIDANCE = {
 PROFILE_DEFAULTS = {
     "default": {},
     "long-review": {
+        "model": "deepseek-v4-pro",
         "max_context_chars": 100000,
         "prompt_char_limit": 24000,
         "chunk_chars": 18000,
@@ -97,7 +130,7 @@ PROFILE_DEFAULTS = {
     },
     "weibo-ablation": {
         "mode": "ablation",
-        "model": "deepseek-v4-flash",
+        "model": "deepseek-v4-pro",
         "max_context_chars": 220000,
         "prompt_char_limit": 24000,
         "chunk_boundary_regex": r"^\s*(?:[-*]\s+|#{1,6}\s+)?Candidate\s+\d+:",
@@ -124,7 +157,7 @@ WEIBO_CONTRACT = """Weibo-specific rules:
 - Prefer distinct factual increments; flag duplicate same-angle chains instead of filling quota.
 - Judge against concise formal Weibo hot-news brief style, not marketing/commentary tone.
 - Return repeatable calibration signals Codex can verify with local validators and ablation gates.
-- For hotness-controlled 01H historical calibration, use deepseek-v4-pro when the active task requires it; cheaper models are only for unrelated low-risk broad passes.
+- Use deepseek-v4-pro for Weibo ablation and calibration packets.
 """
 
 
@@ -218,6 +251,11 @@ def parse_args() -> argparse.Namespace:
         "--json-result",
         action="store_true",
         help="Emit a structured request/result envelope as JSON instead of raw Markdown output.",
+    )
+    parser.add_argument(
+        "--structured-result",
+        action="store_true",
+        help="Ask DeepSeek for a strict JSON findings object and validate it in the result envelope.",
     )
     args = parser.parse_args()
     apply_profile_defaults(args)
@@ -328,6 +366,11 @@ def build_prompt(args: argparse.Namespace, context: str) -> str:
     profile_guidance = ""
     if args.packet_profile.startswith("weibo-") or args.mode in {"ablation", "calibration"}:
         profile_guidance = WEIBO_CONTRACT
+    result_contract = (
+        STRUCTURED_RESULT_SCHEMA.rstrip()
+        if args.structured_result
+        else "- Return exactly these Markdown headings, in this order:\n" + headings
+    )
     return f"""You are a lightweight advisory subagent for Codex.
 
 Mode: {args.mode}
@@ -346,8 +389,7 @@ Rules:
 - Keep the response compact enough to finish completely.
 {chunk_guidance.rstrip()}
 {profile_guidance.rstrip()}
-- Return exactly these Markdown headings, in this order:
-{headings}
+{result_contract}
 
 Task:
 {args.task}
@@ -654,10 +696,19 @@ def mcp_tool_arguments(tool: dict, args: argparse.Namespace, prompt: str, cwd: s
     def accepts(name: str) -> bool:
         return not properties or name in properties
 
+    full_prompt_field = next(
+        (field for field in MCP_DELEGATE_INPUT_FIELDS if accepts(field)),
+        "prompt",
+    )
+    arguments[full_prompt_field] = prompt
     if accepts("prompt"):
         arguments["prompt"] = prompt
     if accepts("task"):
-        arguments["task"] = args.task
+        arguments["task"] = args.task if full_prompt_field != "task" else prompt
+    if accepts("instructions"):
+        arguments["instructions"] = (
+            prompt if full_prompt_field == "instructions" else args.task
+        )
     if accepts("mode"):
         arguments["mode"] = args.mode
     if accepts("packet_profile"):
@@ -668,8 +719,6 @@ def mcp_tool_arguments(tool: dict, args: argparse.Namespace, prompt: str, cwd: s
         arguments["provider"] = args.provider
     if accepts("cwd"):
         arguments["cwd"] = cwd
-    if "prompt" not in arguments and "task" not in arguments:
-        arguments["prompt"] = prompt
     return arguments
 
 
@@ -761,6 +810,101 @@ def missing_required_headings(output: str) -> list[str]:
         if index >= len(ordered) or ordered[index] != heading:
             return REQUIRED_HEADINGS[index:]
     return []
+
+
+def extract_json_object(text: str) -> str | None:
+    fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        fenced_text = fenced.group(1).strip()
+        if fenced_text:
+            return fenced_text
+
+    start = text.find("{")
+    if start < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
+
+
+def validate_structured_result(value: object) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(value, dict):
+        return ["structured result must be a JSON object"]
+
+    for field in STRUCTURED_RESULT_REQUIRED_FIELDS:
+        if field not in value:
+            errors.append(f"missing root field: {field}")
+
+    if "answer" in value and not isinstance(value["answer"], str):
+        errors.append("answer must be a string")
+    if "findings" in value and not isinstance(value["findings"], list):
+        errors.append("findings must be a list")
+    if "uncertainty" in value and not isinstance(value["uncertainty"], list):
+        errors.append("uncertainty must be a list")
+    if "suggested_codex_checks" in value and not isinstance(value["suggested_codex_checks"], list):
+        errors.append("suggested_codex_checks must be a list")
+    if isinstance(value.get("uncertainty"), list):
+        for index, item in enumerate(value["uncertainty"], start=1):
+            if not isinstance(item, str):
+                errors.append(f"uncertainty {index} must be a string")
+    if isinstance(value.get("suggested_codex_checks"), list):
+        for index, item in enumerate(value["suggested_codex_checks"], start=1):
+            if not isinstance(item, str):
+                errors.append(f"suggested_codex_checks {index} must be a string")
+
+    findings = value.get("findings") if isinstance(value, dict) else None
+    if isinstance(findings, list):
+        for index, finding in enumerate(findings, start=1):
+            if not isinstance(finding, dict):
+                errors.append(f"finding {index} must be an object")
+                continue
+            for field in STRUCTURED_FINDING_REQUIRED_FIELDS:
+                if field not in finding:
+                    errors.append(f"finding {index} missing field: {field}")
+                elif not isinstance(finding[field], str):
+                    errors.append(f"finding {index} field {field} must be a string")
+            severity = finding.get("severity")
+            if isinstance(severity, str) and severity not in STRUCTURED_SEVERITY_VALUES:
+                errors.append(
+                    f"finding {index} severity must be one of: "
+                    + ", ".join(STRUCTURED_SEVERITY_VALUES)
+                )
+    return errors
+
+
+def parse_structured_result(output: str) -> tuple[dict | None, list[str]]:
+    candidate = extract_json_object(output)
+    if candidate is None:
+        return None, ["no JSON object found"]
+    try:
+        value = json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        return None, [f"invalid JSON: {exc.msg}"]
+    errors = validate_structured_result(value)
+    if errors:
+        return value if isinstance(value, dict) else None, errors
+    return value, []
 
 
 def validate_delegate_prompt(args: argparse.Namespace, prompt: str) -> None:
@@ -859,6 +1003,7 @@ def request_envelope(args: argparse.Namespace, cwd: str | None) -> dict:
             "max_context_chars": args.max_context_chars,
             "prompt_char_limit": args.prompt_char_limit,
             "max_findings_per_chunk": args.max_findings_per_chunk,
+            "structured_result": args.structured_result,
         },
         "safety_policy": {
             "sandbox_mode": args.sandbox_mode,
@@ -924,13 +1069,20 @@ def chunk_result(
     call: dict,
     missing: list[str],
     warnings: list[str],
+    structured_result: dict | None = None,
+    structured_errors: list[str] | None = None,
+    headings_checked: bool = True,
 ) -> dict:
     exit_code = int(call["exit_code"])
     if missing is None:
         missing = list(REQUIRED_HEADINGS)
     headings_ok = not missing
+    structured_errors = structured_errors or []
+    structured_ok = not structured_errors
     status = "ok"
     if missing:
+        status = "partial"
+    if structured_errors:
         status = "partial"
     if exit_code != 0:
         status = "error"
@@ -939,8 +1091,13 @@ def chunk_result(
         "status": status,
         "driver": call["driver"],
         "exit_code": exit_code,
+        "headings_checked": headings_checked,
         "headings_ok": headings_ok,
         "missing_headings": missing,
+        "structured_ok": structured_ok,
+        "structured_errors": structured_errors,
+        "structured_result": structured_result,
+        "finding_count": len(structured_result.get("findings", [])) if structured_result else 0,
         "warnings": warnings,
         "duration_seconds": call["duration_seconds"],
         "output_chars": len(str(call["output"])),
@@ -1018,8 +1175,27 @@ def main() -> int:
                 code = int(call["exit_code"])
                 chunk_output = str(call["output"])
                 worst_code = code if code != 0 else worst_code
-                missing = missing_required_headings(chunk_output)
                 chunk_warnings = list(call["warnings"])
+                structured_result = None
+                structured_errors: list[str] = []
+                if args.structured_result:
+                    missing = []
+                    structured_result, structured_errors = parse_structured_result(chunk_output)
+                    if structured_errors:
+                        worst_code = worst_code or 3
+                        chunk_warnings.append(
+                            "structured result errors: " + "; ".join(structured_errors)
+                        )
+                        chunk_output = (
+                            chunk_output.rstrip()
+                            + "\n\n[delegate warning]\n"
+                            + "Structured result errors: "
+                            + "; ".join(structured_errors)
+                            + ". Treat this chunk as partial; retry with a smaller packet "
+                            + "or clarify the JSON contract.\n"
+                        )
+                else:
+                    missing = missing_required_headings(chunk_output)
                 if missing:
                     worst_code = worst_code or 3
                     chunk_warnings.append(
@@ -1033,7 +1209,17 @@ def main() -> int:
                         + ". Treat this chunk as partial; retry with smaller --chunk-chars "
                         + "or lower --max-findings-per-chunk if needed.\n"
                     )
-                chunks_meta.append(chunk_result(chunk_id, call, missing, chunk_warnings))
+                chunks_meta.append(
+                    chunk_result(
+                        chunk_id,
+                        call,
+                        missing,
+                        chunk_warnings,
+                        structured_result,
+                        structured_errors,
+                        not args.structured_result,
+                    )
+                )
                 outputs.append(f"# DeepSeek {chunk_id}\n\n{chunk_output}")
             output = "\n\n---\n\n".join(outputs)
             write_output(args.out, output, cwd)
@@ -1062,8 +1248,26 @@ def main() -> int:
         )
         returncode = int(call["exit_code"])
         output = str(call["output"])
-        missing = missing_required_headings(output)
         chunk_warnings = list(call["warnings"])
+        structured_result = None
+        structured_errors: list[str] = []
+        if args.structured_result:
+            missing = []
+            structured_result, structured_errors = parse_structured_result(output)
+            if structured_errors and returncode == 0:
+                returncode = 3
+                chunk_warnings.append(
+                    "structured result errors: " + "; ".join(structured_errors)
+                )
+                output = (
+                    output.rstrip()
+                    + "\n\n[delegate warning]\n"
+                    + "Structured result errors: "
+                    + "; ".join(structured_errors)
+                    + ". Treat this output as partial or malformed.\n"
+                )
+        else:
+            missing = missing_required_headings(output)
         if missing and returncode == 0:
             returncode = 3
             chunk_warnings.append("missing required headings: " + ", ".join(missing))
@@ -1074,7 +1278,17 @@ def main() -> int:
                 + ", ".join(missing)
                 + ". Treat this output as partial or malformed.\n"
             )
-        chunks_meta.append(chunk_result("chunk-001-of-001", call, missing, chunk_warnings))
+        chunks_meta.append(
+            chunk_result(
+                "chunk-001-of-001",
+                call,
+                missing,
+                chunk_warnings,
+                structured_result,
+                structured_errors,
+                not args.structured_result,
+            )
+        )
     except subprocess.TimeoutExpired as exc:
         output = f"DeepSeek delegation timed out after {args.timeout_seconds} seconds.\n"
         if exc.stdout:

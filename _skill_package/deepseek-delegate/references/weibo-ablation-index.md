@@ -1,13 +1,13 @@
 # Weibo Ablation Test Index
 
-Load this file when the user wants repeated 01H Weibo ablation tests, hotness-controlled historical calibration, low-cost model routing, or subagent-style review using DeepSeek Delegate.
+Load this file when the user wants repeated 01H Weibo ablation tests, hotness-controlled historical calibration, or subagent-style review using DeepSeek Delegate.
 
 ## Model Tiers
 
 - Broad batch pass: use `--packet-profile weibo-ablation` with the model required by the active task.
 - Hotness-controlled calibration batch pass: use `--packet-profile weibo-calibration --model deepseek-v4-pro` for the 01H workflow unless the user explicitly changes the model.
 - Dispute pass: rerun only narrow packets after Codex identifies a conflict with validator evidence, source traceability, or local judgment.
-- Do not use the stronger model for every candidate batch unless the low-cost pass produces ambiguous or high-impact findings.
+- Use `deepseek-v4-pro` for every DeepSeek Delegate Weibo ablation or calibration batch.
 
 ## Mature Pattern
 
@@ -24,7 +24,7 @@ This mirrors common multi-agent practice: split bounded tasks, pass minimal task
 
 Keep each chunk below a conservative Windows command-line range. The helper profiles use `chunk_chars=15000`, `prompt_char_limit=24000`, and a Candidate boundary regex that recognizes plain, bullet, or Markdown-heading `Candidate N:` lines; if a single candidate block exceeds the chunk limit, the helper fails closed instead of splitting its source/URL evidence. Trim the block or raise `--chunk-chars` only while staying under `--prompt-char-limit`.
 
-Use `--json-result` for batch smoke tests so Codex can verify every chunk returned `status=ok`, `headings_ok=true`, and the expected low-cost model before reading advisory findings.
+Use `--structured-result --json-result` for batch smoke tests so Codex can verify every chunk returned `status=ok`, `structured_ok=true`, and the expected model before reading advisory findings.
 
 Chunk by evidence boundary, not arbitrary text, when preparing packets:
 

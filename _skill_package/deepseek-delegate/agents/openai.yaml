@@ -1,4 +1,4 @@
 interface:
   display_name: "DeepSeek Delegate"
-  short_description: "Stable advisory DeepSeek delegation with structured status"
-  default_prompt: "Use $deepseek-delegate to delegate a bounded task to DeepSeek TUI, inspect the structured result, and verify findings locally."
+  short_description: "Pro-only packet-local advisory review through DeepSeek TUI CLI"
+  default_prompt: "Use $deepseek-delegate only for a bounded packet, request --structured-result, keep deepseek-v4-pro as the delegate model, inspect the JSON envelope, and verify findings locally."
