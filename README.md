@@ -85,3 +85,7 @@ The MCP wrapper exposes one tool: `deepseek_delegate_review`. It is not a genera
 python -m py_compile .\scripts\deepseek_delegate.py .\scripts\deepseek_delegate_mcp.py
 python -m unittest discover -s tests -v
 ```
+
+## License
+
+MIT-0. See [LICENSE](LICENSE).
