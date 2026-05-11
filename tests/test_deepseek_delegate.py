@@ -7,8 +7,6 @@ import tempfile
 import unittest
 from unittest import mock
 
-import yaml
-
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SKILL_PATH = ROOT / "SKILL.md"
@@ -31,6 +29,21 @@ def load_mcp_module():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def parse_simple_frontmatter(text):
+    frontmatter = text.split("---", 2)[1]
+    metadata = {}
+    for line in frontmatter.splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        metadata[key.strip()] = value
+    return metadata
 
 
 class DeepSeekDelegateTests(unittest.TestCase):
@@ -72,8 +85,7 @@ class DeepSeekDelegateTests(unittest.TestCase):
 
     def test_skill_frontmatter_is_parseable_and_trigger_is_narrow(self):
         text = SKILL_PATH.read_text(encoding="utf-8")
-        frontmatter = text.split("---", 2)[1]
-        metadata = yaml.safe_load(frontmatter)
+        metadata = parse_simple_frontmatter(text)
 
         self.assertEqual(metadata["name"], "deepseek-delegate")
         description = metadata["description"]
@@ -222,6 +234,22 @@ class DeepSeekDelegateTests(unittest.TestCase):
                 with self.assertRaises(self.delegate.DelegateArgumentError):
                     self.delegate.parse_args()
 
+    def test_numeric_arguments_reject_invalid_bounds(self):
+        cases = [
+            ["--task", "x", "--timeout-seconds", "0"],
+            ["--task", "x", "--mcp-probe-timeout-seconds", "0"],
+            ["--task", "x", "--prompt-char-limit", "0"],
+            ["--task", "x", "--max-findings-per-chunk", "0"],
+            ["--task", "x", "--max-context-chars", "-1"],
+            ["--task", "x", "--chunk-chars", "-1"],
+        ]
+        for argv in cases:
+            with self.subTest(argv=argv):
+                with mock.patch.object(self.delegate.sys, "argv", ["deepseek_delegate.py", *argv]):
+                    with self.assertRaises(self.delegate.DelegateArgumentError):
+                        self.delegate.parse_args()
+
+
     def test_main_returns_json_envelope_for_input_json_parse_errors(self):
         with mock.patch.object(
             self.delegate.sys,
@@ -240,7 +268,7 @@ class DeepSeekDelegateTests(unittest.TestCase):
 
     def test_assemble_context_rejects_sensitive_context_text(self):
         args = self.args()
-        args.context_text = "OPENAI_API_KEY=sk-abcdefghijklmnop1234567890"
+        args.context_text = "OPENAI_API_KEY=" + "sk-" + "a" * 30
 
         with self.assertRaises(self.delegate.DelegateSetupError):
             self.delegate.assemble_context(args, None)
@@ -288,6 +316,28 @@ class DeepSeekDelegateTests(unittest.TestCase):
         invocation = run.call_args.args[0]
         self.assertEqual(invocation[:5], ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
         self.assertEqual(invocation[-2:], ["exec", "--help"])
+
+    def test_exec_stdin_probe_requires_stdin_flag(self):
+        completed = mock.Mock(stdout="Usage: deepseek exec -f, --file <path>", stderr="")
+        with mock.patch.object(self.delegate.subprocess, "run", return_value=completed):
+            self.assertFalse(self.delegate.deepseek_exec_supports_transport("exec-stdin"))
+
+    def test_exec_driver_runs_outside_requested_cwd(self):
+        args = self.args()
+        completed = mock.Mock(stdout="{}", stderr="", returncode=0)
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(self.delegate.subprocess, "run", return_value=completed) as run:
+                self.delegate.call_deepseek_exec_driver(
+                    args,
+                    "prompt",
+                    tmp,
+                    5,
+                    "exec-argv",
+                )
+
+        run_cwd = pathlib.Path(run.call_args.kwargs["cwd"]).resolve()
+        self.assertNotEqual(run_cwd, pathlib.Path(tmp).resolve())
+        self.assertEqual(run_cwd.name, "deepseek-delegate-cwd")
 
     def test_mcp_arguments_use_prompt_field_when_available(self):
         tool = {"inputSchema": {"properties": {"prompt": {}, "task": {}}}}
@@ -499,7 +549,7 @@ class DeepSeekDelegateTests(unittest.TestCase):
     def test_sensitive_text_rejects_secret_like_context(self):
         with self.assertRaises(self.delegate.DelegateSetupError):
             self.delegate.reject_sensitive_text(
-                "api_key=abc123def456ghi789jkl012", "unit test"
+                "api_" + "key=" + "abc123XYZ_456def789GHI", "unit test"
             )
 
     def test_sensitive_text_allows_benign_token_variables(self):
@@ -508,14 +558,14 @@ class DeepSeekDelegateTests(unittest.TestCase):
             "unit test",
         )
         self.delegate.reject_sensitive_text(
-            "api_key=redacted-example-value\nOPENAI_API_KEY=<your key here>",
+            "api_" + "key=redacted-example-value\nOPENAI_API_KEY=<your key here>",
             "unit test",
         )
 
     def test_sensitive_text_rejects_explicit_access_token(self):
         with self.assertRaises(self.delegate.DelegateSetupError):
             self.delegate.reject_sensitive_text(
-                "access_token=abc123def456ghi789jkl012", "unit test"
+                "access_" + "token=" + "abc123XYZ_456def789GHI", "unit test"
             )
 
     def test_sensitive_text_rejects_real_auth_header(self):
@@ -611,6 +661,40 @@ class DeepSeekDelegateTests(unittest.TestCase):
 
         self.assertEqual(result["result"]["status"], "setup_error")
         self.assertEqual(result["result"]["exit_code"], 2)
+
+    def test_local_mcp_wrapper_runs_helper_outside_payload_cwd(self):
+        completed = mock.Mock(
+            stdout=json.dumps({"result": {"status": "ok", "exit_code": 0}}),
+            stderr="",
+            returncode=0,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(self.delegate_mcp.subprocess, "run", return_value=completed) as run:
+                result = self.delegate_mcp.run_delegate_review(
+                    {"task": "Review packet.", "cwd": tmp, "context_text": "hello"}
+                )
+
+        self.assertEqual(result["result"]["status"], "ok")
+        run_cwd = pathlib.Path(run.call_args.kwargs["cwd"]).resolve()
+        self.assertNotEqual(run_cwd, pathlib.Path(tmp).resolve())
+        self.assertEqual(run_cwd.name, "deepseek-delegate-cwd")
+
+
+    def test_local_mcp_wrapper_rejects_invalid_numeric_options(self):
+        bad_values = [
+            {"timeout_seconds": True},
+            {"timeout_seconds": 0},
+            {"max_context_chars": True},
+            {"max_context_chars": -1},
+            {"chunk_chars": True},
+            {"chunk_chars": -1},
+        ]
+        for value in bad_values:
+            with self.subTest(value=value):
+                result = self.delegate_mcp.run_delegate_review({"task": "Review packet.", **value})
+
+                self.assertEqual(result["result"]["status"], "setup_error")
+                self.assertEqual(result["result"]["exit_code"], 2)
 
 
 if __name__ == "__main__":

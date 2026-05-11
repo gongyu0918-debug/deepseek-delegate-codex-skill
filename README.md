@@ -16,6 +16,12 @@ Do not use it for implementation, full-repo review, architecture decisions, migr
 
 ## Install
 
+Requirements:
+
+- Python 3.10 or newer.
+- DeepSeek TUI available as `deepseek`.
+- An authenticated DeepSeek TUI profile that can run `deepseek-v4-pro`.
+
 Clone or copy this repository into a Codex skills directory:
 
 ```powershell
@@ -71,6 +77,15 @@ Codex MCP host -> deepseek_delegate_mcp.py -> deepseek_delegate.py -> deepseek e
 
 The MCP wrapper exposes one tool: `deepseek_delegate_review`. It is not a general shell bridge.
 
+## Security Model
+
+- Local-only stdio/CLI workflow. Do not expose the MCP wrapper as a network service.
+- No generic shell tool, patch worker, test runner, direct API client, provider router, or background job lifecycle.
+- Context files are read before delegation; the downstream DeepSeek process is launched from an isolated temp cwd, not the target repo.
+- Review defaults are advisory and read-oriented; Codex owns file edits, verification, and final judgment.
+- Context files should be bounded packet inputs. Do not pass secrets, credential files, cookies, or broad conversation history.
+- Redaction is pattern-based and conservative. Treat it as a guardrail, not a DLP system.
+
 ## Files
 
 - `SKILL.md`: trigger boundary and operating contract.
@@ -85,6 +100,8 @@ The MCP wrapper exposes one tool: `deepseek_delegate_review`. It is not a genera
 python -m py_compile .\scripts\deepseek_delegate.py .\scripts\deepseek_delegate_mcp.py
 python -m unittest discover -s tests -v
 ```
+
+The test suite uses the Python standard library only.
 
 ## License
 

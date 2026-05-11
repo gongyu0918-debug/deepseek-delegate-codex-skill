@@ -397,6 +397,7 @@ def parse_args() -> argparse.Namespace:
     if not args.task:
         argument_error(args, "--task is required unless supplied by --input-json")
     apply_profile_defaults(args)
+    validate_numeric_args(args)
     validate_provider_model(args, parser)
     return args
 
@@ -579,6 +580,22 @@ def validate_provider_model(args: argparse.Namespace, parser: argparse.ArgumentP
             "non-deepseek provider requires an explicit compatible --model; "
             f"got provider={args.provider!r} model={args.model!r}"
         )
+
+
+def validate_numeric_args(args: argparse.Namespace) -> None:
+    positive_fields = (
+        "timeout_seconds",
+        "mcp_probe_timeout_seconds",
+        "prompt_char_limit",
+        "max_findings_per_chunk",
+    )
+    nonnegative_fields = ("max_context_chars", "chunk_chars")
+    for field in positive_fields:
+        if getattr(args, field) <= 0:
+            argument_error(args, f"--{field.replace('_', '-')} must be a positive integer")
+    for field in nonnegative_fields:
+        if getattr(args, field) < 0:
+            argument_error(args, f"--{field.replace('_', '-')} must be a non-negative integer")
 
 
 def read_context_files(
@@ -835,6 +852,12 @@ def deepseek_command_invocation(command_args: list[str]) -> list[str]:
     return [found, *command_args]
 
 
+def isolated_delegate_cwd() -> str:
+    path = pathlib.Path(tempfile.gettempdir()) / "deepseek-delegate-cwd"
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
 def deepseek_invocation(
     args: argparse.Namespace,
     prompt: str,
@@ -886,7 +909,7 @@ def deepseek_exec_supports_transport(backend_transport: str) -> bool:
     if backend_transport == "exec-file":
         return "--prompt-file" in help_text or "--file" in help_text
     if backend_transport == "exec-stdin":
-        return "--stdin" in help_text or "-f, --file" in help_text
+        return "--stdin" in help_text
     return False
 
 
@@ -992,7 +1015,7 @@ def mcp_request(
 def start_mcp_server(cwd: str | None) -> subprocess.Popen[str]:
     return subprocess.Popen(
         deepseek_mcp_invocation(),
-        cwd=cwd,
+        cwd=isolated_delegate_cwd(),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -1198,7 +1221,15 @@ def call_deepseek_mcp_driver(
             proc,
             2,
             "tools/call",
-            {"name": tool.get("name"), "arguments": mcp_tool_arguments(tool, args, prompt, cwd)},
+            {
+                "name": tool.get("name"),
+                "arguments": mcp_tool_arguments(
+                    tool,
+                    args,
+                    prompt,
+                    isolated_delegate_cwd(),
+                ),
+            },
             timeout_seconds=args.timeout_seconds,
         )
         return normalize_mcp_delegate_output(args, extract_mcp_text(result))
@@ -1394,7 +1425,7 @@ def call_deepseek_exec_driver(
             )
         result = subprocess.run(
             invocation,
-            cwd=cwd,
+            cwd=isolated_delegate_cwd(),
             input=run_input,
             text=True,
             encoding="utf-8",

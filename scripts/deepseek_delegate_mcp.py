@@ -16,6 +16,12 @@ TOOL_NAME = "deepseek_delegate_review"
 SCRIPT_PATH = pathlib.Path(__file__).with_name("deepseek_delegate.py")
 
 
+def isolated_delegate_cwd() -> str:
+    path = pathlib.Path(tempfile.gettempdir()) / "deepseek-delegate-cwd"
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
 def response(request_id: Any, result: Any = None, error: dict | None = None) -> dict:
     payload: dict[str, Any] = {"jsonrpc": JSONRPC, "id": request_id}
     if error is not None:
@@ -109,6 +115,17 @@ def validate_context_files(raw_files: Any, cwd: str | None) -> list[str]:
     return normalized
 
 
+def validate_int_field(arguments: dict, field: str, default: int, minimum: int) -> int:
+    raw = arguments.get(field, default)
+    if not isinstance(raw, int) or isinstance(raw, bool):
+        raise ValueError(f"{field} must be an integer")
+    if raw < minimum:
+        if minimum == 0:
+            raise ValueError(f"{field} must be a non-negative integer")
+        raise ValueError(f"{field} must be an integer >= {minimum}")
+    return raw
+
+
 def build_delegate_payload(arguments: dict) -> tuple[dict, int]:
     if not isinstance(arguments, dict):
         raise ValueError("arguments must be an object")
@@ -117,18 +134,21 @@ def build_delegate_payload(arguments: dict) -> tuple[dict, int]:
         raise ValueError("task is required")
     cwd = validate_cwd(arguments.get("cwd"))
     context_files = validate_context_files(arguments.get("context_files"), cwd)
+    context_cwd = cwd
+    if context_files and context_cwd is None:
+        context_cwd = str(pathlib.Path.cwd().resolve())
     context_text = arguments.get("context_text")
     if context_text is not None and not isinstance(context_text, str):
         raise ValueError("context_text must be a string")
 
-    timeout_seconds = int(arguments.get("timeout_seconds", 180))
+    timeout_seconds = validate_int_field(arguments, "timeout_seconds", 180, 1)
     payload = {
         "task": task,
         "mode": arguments.get("mode", "review"),
         "packet_profile": arguments.get("packet_profile", "default"),
         "context_text": context_text,
         "context_files": context_files,
-        "cwd": cwd,
+        "cwd": context_cwd,
         "options": {
             "json_result": True,
             "structured_result": bool(arguments.get("structured_result", True)),
@@ -137,7 +157,7 @@ def build_delegate_payload(arguments: dict) -> tuple[dict, int]:
     }
     for field in ("max_context_chars", "chunk_chars"):
         if field in arguments:
-            payload["options"][field] = int(arguments[field])
+            payload["options"][field] = validate_int_field(arguments, field, 0, 0)
     return payload, timeout_seconds
 
 
@@ -162,7 +182,7 @@ def run_delegate_review(arguments: dict) -> dict:
 
         result = subprocess.run(
             [sys.executable, str(SCRIPT_PATH), "--input-json", str(tmp_path), "--json-result"],
-            cwd=payload.get("cwd") or None,
+            cwd=isolated_delegate_cwd(),
             text=True,
             encoding="utf-8",
             errors="replace",

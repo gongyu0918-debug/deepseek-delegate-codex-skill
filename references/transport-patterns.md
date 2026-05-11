@@ -33,16 +33,18 @@ Use `scripts/deepseek_delegate_mcp.py` only when a host needs stdio JSON tools. 
 Borrowed community constraints:
 
 - CodexSaver: thin JSON-RPC stdio server with `initialize`, `tools/list`, and `tools/call`.
-- Safe Agent CLI MCP: no generic shell, no arbitrary command tool, and realpath checks for context files under `cwd`.
+- Safe Agent CLI MCP: no generic shell, no arbitrary command tool, realpath checks for context files under `cwd`, and explicit input validation before spawning the downstream CLI.
 - OpenClaw MCP: stdio transport is a local child process communicating through stdin/stdout.
+- ACPX/openclaw-cli: prefer file/stdin prompt paths for long prompts when the downstream CLI actually advertises that transport.
 
 Do not register this wrapper as a broad always-on MCP suite. A single narrow tool keeps prompt/tool-schema overhead lower than a general CLI bridge. Tool failures should return the helper-style `status=setup_error` or `status=timeout` envelope instead of protocol-level internal errors whenever possible.
 
 ## Backend Transport
 
-- Current default: `exec-argv`, because local `deepseek v0.8.26` exposes `deepseek exec [ARGS]...`.
+- Current default: `exec-argv`, because DeepSeek TUI `v0.8.28` still exposes `deepseek exec [ARGS]...` with no advertised prompt-file or stdin flag.
 - Current driver default: `exec`, because local DeepSeek MCP probing does not expose a delegate/review tool and unnecessarily starts another DeepSeek process.
 - Reserved only: `exec-file` and `exec-stdin`. Enable them only after `deepseek exec --help` advertises prompt-file or stdin support.
+- Launch DeepSeek child processes from an isolated temp cwd. Use the requested `cwd` only for reading context files and resolving output paths.
 - Existing DeepSeek MCP probing remains valid only when `deepseek mcp-server` exposes a real delegate/review tool through `tools/list`.
 
 ## Long Context
