@@ -67,6 +67,7 @@ Use an empty findings array only when there are no concrete findings.
 DRIVER_CHOICES = ("auto", "exec", "mcp")
 BACKEND_TRANSPORT_CHOICES = ("auto", "exec-argv", "exec-file", "exec-stdin")
 PROMPT_LIMITED_BACKENDS = ("exec-argv",)
+DEFAULT_MCP_PROBE_TIMEOUT_SECONDS = 8
 MCP_TOOL_NAME_KEYWORDS = ("delegate", "review")
 MCP_TOOL_BLOCKLIST_KEYWORDS = ("shell", "exec", "command", "terminal", "process")
 MCP_DELEGATE_INPUT_FIELDS = ("prompt", "task", "instructions")
@@ -87,6 +88,7 @@ INPUT_JSON_FIELD_MAP = {
     "approval_policy": "approval_policy",
     "max_context_chars": "max_context_chars",
     "timeout_seconds": "timeout_seconds",
+    "mcp_probe_timeout_seconds": "mcp_probe_timeout_seconds",
     "prompt_char_limit": "prompt_char_limit",
     "chunk_chars": "chunk_chars",
     "chunk_boundary_regex": "chunk_boundary_regex",
@@ -99,6 +101,7 @@ INPUT_JSON_FIELD_MAP = {
 INT_FIELDS = {
     "max_context_chars",
     "timeout_seconds",
+    "mcp_probe_timeout_seconds",
     "prompt_char_limit",
     "chunk_chars",
     "max_findings_per_chunk",
@@ -112,6 +115,14 @@ class DelegateSetupError(Exception):
     exit_code = 2
 
 
+class DelegateArgumentError(DelegateSetupError):
+    """Argument parsing error that should be reported as setup_error."""
+
+    def __init__(self, message: str, args_namespace: argparse.Namespace | None = None):
+        super().__init__(message)
+        self.args_namespace = args_namespace
+
+
 class DelegateExecutableError(DelegateSetupError):
     """DeepSeek executable or transport setup failed."""
 
@@ -120,6 +131,11 @@ class DelegateExecutableError(DelegateSetupError):
 
 class DelegateTimeoutError(Exception):
     """Delegate transport timed out."""
+
+
+class DelegateArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise DelegateArgumentError(message)
 
 
 SENSITIVE_PATTERNS = [
@@ -206,7 +222,7 @@ WEIBO_CONTRACT = """Weibo-specific rules:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+    parser = DelegateArgumentParser(
         description="Call deepseek exec with a compact delegation packet."
     )
     parser.add_argument(
@@ -287,6 +303,12 @@ def parse_args() -> argparse.Namespace:
         help="Timeout for each deepseek exec call.",
     )
     parser.add_argument(
+        "--mcp-probe-timeout-seconds",
+        type=int,
+        default=DEFAULT_MCP_PROBE_TIMEOUT_SECONDS,
+        help="Short timeout for MCP tools/list probing before auto falls back to exec.",
+    )
+    parser.add_argument(
         "--prompt-char-limit",
         type=int,
         default=24000,
@@ -328,10 +350,14 @@ def parse_args() -> argparse.Namespace:
     args._chunk_reason = None
     apply_input_json(args, parser)
     if not args.task:
-        parser.error("--task is required unless supplied by --input-json")
+        argument_error(args, "--task is required unless supplied by --input-json")
     apply_profile_defaults(args)
     validate_provider_model(args, parser)
     return args
+
+
+def argument_error(args: argparse.Namespace, message: str) -> None:
+    raise DelegateArgumentError(message, args)
 
 
 def apply_input_json(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -346,21 +372,21 @@ def apply_input_json(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         try:
             raw = input_path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
-            parser.error(f"cannot read --input-json {args.input_json!r}: {exc}")
+            argument_error(args, f"cannot read --input-json {args.input_json!r}: {exc}")
         args.input_transport = "json-file"
 
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
-        parser.error(f"--input-json is not valid JSON: {exc.msg}")
+        argument_error(args, f"--input-json is not valid JSON: {exc.msg}")
     if not isinstance(payload, dict):
-        parser.error("--input-json root must be a JSON object")
+        argument_error(args, "--input-json root must be a JSON object")
 
     options = payload.get("options", {})
     if options is None:
         options = {}
     if not isinstance(options, dict):
-        parser.error("--input-json field 'options' must be an object when present")
+        argument_error(args, "--input-json field 'options' must be an object when present")
 
     for source in (payload, options):
         for key, value in source.items():
@@ -386,17 +412,17 @@ def apply_input_json_field(
         elif isinstance(value, list) and all(isinstance(item, str) for item in value):
             normalized = list(value)
         else:
-            parser.error("--input-json context_files must be a string or string array")
+            argument_error(args, "--input-json context_files must be a string or string array")
         if not field_was_supplied_by_cli(field):
             args.context_file = normalized
             args._input_json_fields.add(field)
         return
 
     if field in BOOL_FIELDS and not isinstance(value, bool):
-        parser.error(f"--input-json field {field!r} must be a boolean")
+        argument_error(args, f"--input-json field {field!r} must be a boolean")
     if field in INT_FIELDS:
         if not isinstance(value, int) or isinstance(value, bool):
-            parser.error(f"--input-json field {field!r} must be an integer")
+            argument_error(args, f"--input-json field {field!r} must be an integer")
     string_fields = {
         "task",
         "context_text",
@@ -411,12 +437,13 @@ def apply_input_json_field(
     nullable_string_fields = {"context_text", "cwd", "chunk_boundary_regex", "out"}
     if field in string_fields:
         if value is None and field not in nullable_string_fields:
-            parser.error(f"--input-json field {field!r} must be a string")
+            argument_error(args, f"--input-json field {field!r} must be a string")
         if value is not None and not isinstance(value, str):
-            parser.error(f"--input-json field {field!r} must be a string")
+            argument_error(args, f"--input-json field {field!r} must be a string")
     choices = CHOICE_FIELDS.get(field)
     if choices and value not in choices:
-        parser.error(
+        argument_error(
+            args,
             f"--input-json field {field!r} must be one of: " + ", ".join(choices)
         )
 
@@ -442,6 +469,50 @@ def field_was_supplied(args: argparse.Namespace, field: str) -> bool:
     return field_was_supplied_by_cli(field) or field in getattr(args, "_input_json_fields", set())
 
 
+def raw_argv_option_value(name: str) -> str | None:
+    supplied = sys.argv[1:]
+    for index, arg in enumerate(supplied):
+        if arg == name and index + 1 < len(supplied):
+            return supplied[index + 1]
+        if arg.startswith(name + "="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def fallback_args_for_setup_error(partial: argparse.Namespace | None = None) -> argparse.Namespace:
+    if partial is not None:
+        return partial
+    return argparse.Namespace(
+        input_json=raw_argv_option_value("--input-json"),
+        input_transport="cli",
+        task=None,
+        mode="answer",
+        packet_profile="default",
+        model="deepseek-v4-pro",
+        provider="deepseek",
+        driver=raw_argv_option_value("--driver") or "auto",
+        backend_transport=raw_argv_option_value("--backend-transport") or "auto",
+        context_text=None,
+        context_file=[],
+        chunk_chars=0,
+        chunk_boundary_regex=None,
+        max_context_chars=24000,
+        timeout_seconds=180,
+        mcp_probe_timeout_seconds=DEFAULT_MCP_PROBE_TIMEOUT_SECONDS,
+        prompt_char_limit=24000,
+        max_findings_per_chunk=5,
+        structured_result=option_was_supplied("--structured-result"),
+        sandbox_mode="read-only",
+        approval_policy="never",
+        out=raw_argv_option_value("--out"),
+        json_result=option_was_supplied("--json-result"),
+        _input_json_fields=set(),
+        _resolved_backend_transport=None,
+        _single_packet_attempted=False,
+        _chunk_reason=None,
+    )
+
+
 def apply_profile_defaults(args: argparse.Namespace) -> None:
     defaults = PROFILE_DEFAULTS.get(args.packet_profile, {})
     for field, value in defaults.items():
@@ -458,7 +529,8 @@ def apply_profile_defaults(args: argparse.Namespace) -> None:
 
 def validate_provider_model(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if args.provider != "deepseek" and args.model.startswith("deepseek-"):
-        parser.error(
+        argument_error(
+            args,
             "non-deepseek provider requires an explicit compatible --model; "
             f"got provider={args.provider!r} model={args.model!r}"
         )
@@ -696,13 +768,36 @@ def deepseek_executable() -> str | None:
     return shutil.which("deepseek")
 
 
+def deepseek_command_invocation(command_args: list[str]) -> list[str]:
+    found = deepseek_executable()
+    if not found:
+        return ["deepseek", *command_args]
+
+    suffix = pathlib.Path(found).suffix.lower()
+    if os.name == "nt":
+        if suffix == ".ps1":
+            return [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                found,
+                *command_args,
+            ]
+        if suffix in {".cmd", ".bat"}:
+            command_line = subprocess.list2cmdline([found, *command_args])
+            return ["cmd.exe", "/d", "/s", "/c", command_line]
+
+    return [found, *command_args]
+
+
 def deepseek_invocation(
     args: argparse.Namespace,
     prompt: str,
     backend_transport: str = "exec-argv",
     prompt_path: pathlib.Path | None = None,
 ) -> list[str]:
-    found = deepseek_executable()
     common_args = [
         "--provider",
         args.provider,
@@ -722,51 +817,17 @@ def deepseek_invocation(
     else:
         exec_args = ["exec", prompt]
 
-    if not found:
-        return ["deepseek", *common_args, *exec_args]
-
-    suffix = pathlib.Path(found).suffix.lower()
-    if os.name == "nt":
-        if suffix == ".ps1":
-            return [
-                "powershell.exe",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                found,
-                *common_args,
-                *exec_args,
-            ]
-        if suffix in {".cmd", ".bat"}:
-            command_line = subprocess.list2cmdline(
-                [
-                    found,
-                    *common_args,
-                    *exec_args,
-                ]
-            )
-            return ["cmd.exe", "/d", "/s", "/c", command_line]
-
-    return [
-        found,
-        *common_args,
-        *exec_args,
-    ]
+    return deepseek_command_invocation([*common_args, *exec_args])
 
 
 def deepseek_mcp_invocation() -> list[str]:
-    found = deepseek_executable()
-    if not found:
-        return ["deepseek", "mcp-server"]
-    return [found, "mcp-server"]
+    return deepseek_command_invocation(["mcp-server"])
 
 
 def deepseek_exec_supports_transport(backend_transport: str) -> bool:
     if backend_transport == "exec-argv":
         return True
-    found = deepseek_executable()
-    invocation = [found or "deepseek", "exec", "--help"]
+    invocation = deepseek_command_invocation(["exec", "--help"])
     try:
         result = subprocess.run(
             invocation,
@@ -949,7 +1010,7 @@ def resolve_driver(args: argparse.Namespace, cwd: str | None) -> tuple[str, list
         return "exec", [], None
 
     try:
-        tool = select_mcp_delegate_tool(list_mcp_tools(cwd, args.timeout_seconds))
+        tool = select_mcp_delegate_tool(list_mcp_tools(cwd, args.mcp_probe_timeout_seconds))
     except Exception as exc:
         if args.driver == "mcp":
             raise RuntimeError(f"requested mcp driver but MCP probe failed: {exc}") from exc
@@ -964,7 +1025,7 @@ def resolve_driver(args: argparse.Namespace, cwd: str | None) -> tuple[str, list
 
 
 def mcp_tool_arguments(tool: dict, args: argparse.Namespace, prompt: str, cwd: str | None) -> dict:
-    arguments: dict[str, str | None] = {}
+    arguments: dict[str, object] = {}
     schema = tool.get("inputSchema") or tool.get("input_schema") or {}
     properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
     if not isinstance(properties, dict):
@@ -996,6 +1057,20 @@ def mcp_tool_arguments(tool: dict, args: argparse.Namespace, prompt: str, cwd: s
         arguments["provider"] = args.provider
     if accepts("cwd"):
         arguments["cwd"] = cwd
+    if accepts("structured_result"):
+        arguments["structured_result"] = args.structured_result
+    if accepts("json_result"):
+        arguments["json_result"] = args.json_result
+    if accepts("timeout_seconds"):
+        arguments["timeout_seconds"] = args.timeout_seconds
+    if accepts("max_context_chars"):
+        arguments["max_context_chars"] = args.max_context_chars
+    if accepts("chunk_chars"):
+        arguments["chunk_chars"] = args.chunk_chars
+    if accepts("chunk_boundary_regex"):
+        arguments["chunk_boundary_regex"] = args.chunk_boundary_regex
+    if accepts("max_findings_per_chunk"):
+        arguments["max_findings_per_chunk"] = args.max_findings_per_chunk
     return arguments
 
 
@@ -1011,6 +1086,49 @@ def extract_mcp_text(result: dict) -> str:
     if isinstance(result.get("text"), str):
         return result["text"]
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def exit_code_from_status(status: object) -> int:
+    if status == "ok":
+        return 0
+    if status == "partial":
+        return 3
+    if status == "timeout":
+        return 124
+    if status == "setup_error":
+        return 2
+    if status == "error":
+        return 1
+    return 1
+
+
+def normalize_mcp_delegate_output(args: argparse.Namespace, output: str) -> tuple[int, str]:
+    try:
+        value = json.loads(output)
+    except json.JSONDecodeError:
+        return 0, output
+    if not isinstance(value, dict):
+        return 0, output
+    result = value.get("result")
+    if not isinstance(result, dict):
+        return 0, output
+
+    exit_code = result.get("exit_code")
+    if not isinstance(exit_code, int):
+        exit_code = exit_code_from_status(result.get("status"))
+
+    chunks = result.get("chunks")
+    if (
+        args.structured_result
+        and result.get("status") == "ok"
+        and isinstance(chunks, list)
+        and len(chunks) == 1
+        and isinstance(chunks[0], dict)
+        and chunks[0].get("structured_ok") is True
+        and isinstance(chunks[0].get("structured_result"), dict)
+    ):
+        return exit_code, json.dumps(chunks[0]["structured_result"], ensure_ascii=False)
+    return exit_code, output
 
 
 def call_deepseek_mcp_driver(
@@ -1040,7 +1158,7 @@ def call_deepseek_mcp_driver(
             {"name": tool.get("name"), "arguments": mcp_tool_arguments(tool, args, prompt, cwd)},
             timeout_seconds=args.timeout_seconds,
         )
-        return 0, extract_mcp_text(result)
+        return normalize_mcp_delegate_output(args, extract_mcp_text(result))
     finally:
         kill_process(proc)
 
@@ -1324,6 +1442,11 @@ def request_envelope(args: argparse.Namespace, cwd: str | None) -> dict:
         "context_files": list(args.context_file),
         "driver": args.driver,
         "backend_transport_request": getattr(args, "backend_transport", "auto"),
+        "mcp_probe_timeout_seconds": getattr(
+            args,
+            "mcp_probe_timeout_seconds",
+            DEFAULT_MCP_PROBE_TIMEOUT_SECONDS,
+        ),
         "chunk_policy": {
             "chunk_chars": args.chunk_chars,
             "chunk_boundary_regex": args.chunk_boundary_regex,
@@ -1456,10 +1579,30 @@ def emit_result(args: argparse.Namespace, output: str, envelope: dict) -> None:
 
 
 def main() -> int:
-    args = parse_args()
+    started_at = time.monotonic()
+    try:
+        args = parse_args()
+    except DelegateArgumentError as exc:
+        args = fallback_args_for_setup_error(getattr(exc, "args_namespace", None))
+        output = f"DeepSeek delegation setup failed: {exc}\n"
+        envelope = make_result_envelope(
+            args,
+            None,
+            False,
+            "setup_error",
+            None,
+            int(getattr(exc, "exit_code", 2)),
+            [],
+            [str(exc)],
+            started_at,
+        )
+        if args.json_result:
+            emit_result(args, output, envelope)
+        else:
+            print(output, file=sys.stderr)
+        return int(getattr(exc, "exit_code", 2))
     cwd = None
     cwd_valid = False
-    started_at = time.monotonic()
     selected_driver: str | None = None
     mcp_tool: dict | None = None
     chunks_meta: list[dict] = []

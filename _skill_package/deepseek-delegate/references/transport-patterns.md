@@ -7,6 +7,7 @@ Load this file when changing JSON input, MCP wrapper behavior, backend prompt tr
 - Prefer `--input-json <file>` for normal automation. It moves `task`, packet text, file list, and options out of the shell command line.
 - Keep `--json-result --structured-result` for machine-readable review output.
 - Keep `--driver auto` unless explicitly testing MCP fail-closed behavior.
+- Keep MCP discovery short. `--mcp-probe-timeout-seconds` is separate from the real delegate timeout so auto fallback does not hang on `tools/list`.
 
 Example request:
 
@@ -35,7 +36,7 @@ Borrowed community constraints:
 - Safe Agent CLI MCP: no generic shell, no arbitrary command tool, and realpath checks for context files under `cwd`.
 - OpenClaw MCP: stdio transport is a local child process communicating through stdin/stdout.
 
-Do not register this wrapper as a broad always-on MCP suite. A single narrow tool keeps prompt/tool-schema overhead lower than a general CLI bridge.
+Do not register this wrapper as a broad always-on MCP suite. A single narrow tool keeps prompt/tool-schema overhead lower than a general CLI bridge. Tool failures should return the helper-style `status=setup_error` or `status=timeout` envelope instead of protocol-level internal errors whenever possible.
 
 ## Backend Transport
 

@@ -69,6 +69,7 @@ class DeepSeekDelegateTests(unittest.TestCase):
             max_context_chars=24000,
             prompt_char_limit=24000,
             timeout_seconds=180,
+            mcp_probe_timeout_seconds=8,
             max_findings_per_chunk=5,
             structured_result=False,
             sandbox_mode="read-only",
@@ -213,7 +214,7 @@ class DeepSeekDelegateTests(unittest.TestCase):
             ["deepseek_delegate.py", "--input-json", "-"],
         ):
             with mock.patch.object(self.delegate.sys, "stdin", io.StringIO("{bad")):
-                with self.assertRaises(SystemExit):
+                with self.assertRaises(self.delegate.DelegateArgumentError):
                     self.delegate.parse_args()
 
         with mock.patch.object(
@@ -222,8 +223,24 @@ class DeepSeekDelegateTests(unittest.TestCase):
             ["deepseek_delegate.py", "--input-json", "-"],
         ):
             with mock.patch.object(self.delegate.sys, "stdin", io.StringIO('{"context_text":"x"}')):
-                with self.assertRaises(SystemExit):
+                with self.assertRaises(self.delegate.DelegateArgumentError):
                     self.delegate.parse_args()
+
+    def test_main_returns_json_envelope_for_input_json_parse_errors(self):
+        with mock.patch.object(
+            self.delegate.sys,
+            "argv",
+            ["deepseek_delegate.py", "--input-json", "-", "--json-result"],
+        ):
+            with mock.patch.object(self.delegate.sys, "stdin", io.StringIO("{bad")):
+                stdout = io.StringIO()
+                with mock.patch.object(self.delegate.sys, "stdout", stdout):
+                    code = self.delegate.main()
+
+        envelope = json.loads(stdout.getvalue())
+        self.assertEqual(code, 2)
+        self.assertEqual(envelope["result"]["status"], "setup_error")
+        self.assertIn("--input-json is not valid JSON", envelope["result"]["warnings"][0])
 
     def test_assemble_context_rejects_sensitive_context_text(self):
         args = self.args()
@@ -257,6 +274,25 @@ class DeepSeekDelegateTests(unittest.TestCase):
             with self.assertRaisesRegex(self.delegate.DelegateSetupError, "reserved"):
                 self.delegate.resolve_backend_transport(args, "exec")
 
+    def test_deepseek_mcp_invocation_reuses_windows_shim_wrapper(self):
+        with mock.patch.object(self.delegate, "deepseek_executable", return_value="C:/bin/deepseek.ps1"):
+            with mock.patch.object(self.delegate.os, "name", "nt"):
+                invocation = self.delegate.deepseek_mcp_invocation()
+
+        self.assertEqual(invocation[:5], ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        self.assertEqual(invocation[-1], "mcp-server")
+
+    def test_transport_probe_reuses_windows_shim_wrapper(self):
+        completed = mock.Mock(stdout="Usage: deepseek exec --prompt-file", stderr="")
+        with mock.patch.object(self.delegate, "deepseek_executable", return_value="C:/bin/deepseek.ps1"):
+            with mock.patch.object(self.delegate.os, "name", "nt"):
+                with mock.patch.object(self.delegate.subprocess, "run", return_value=completed) as run:
+                    self.assertTrue(self.delegate.deepseek_exec_supports_transport("exec-file"))
+
+        invocation = run.call_args.args[0]
+        self.assertEqual(invocation[:5], ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        self.assertEqual(invocation[-2:], ["exec", "--help"])
+
     def test_mcp_arguments_use_prompt_field_when_available(self):
         tool = {"inputSchema": {"properties": {"prompt": {}, "task": {}}}}
 
@@ -287,6 +323,71 @@ class DeepSeekDelegateTests(unittest.TestCase):
 
         self.assertEqual(result["task"], "FULL PROMPT")
         self.assertEqual(result["model"], "deepseek-v4-pro")
+
+    def test_mcp_arguments_forward_behavior_options_when_supported(self):
+        tool = {
+            "inputSchema": {
+                "properties": {
+                    "prompt": {},
+                    "structured_result": {},
+                    "timeout_seconds": {},
+                    "max_context_chars": {},
+                    "chunk_chars": {},
+                    "max_findings_per_chunk": {},
+                }
+            }
+        }
+        args = self.args()
+        args.structured_result = True
+        args.timeout_seconds = 222
+        args.max_context_chars = 333
+        args.chunk_chars = 44
+        args.max_findings_per_chunk = 6
+
+        result = self.delegate.mcp_tool_arguments(tool, args, "FULL PROMPT", None)
+
+        self.assertTrue(result["structured_result"])
+        self.assertEqual(result["timeout_seconds"], 222)
+        self.assertEqual(result["max_context_chars"], 333)
+        self.assertEqual(result["chunk_chars"], 44)
+        self.assertEqual(result["max_findings_per_chunk"], 6)
+
+    def test_mcp_envelope_status_controls_exit_code_and_structured_output(self):
+        args = self.args()
+        args.structured_result = True
+        envelope = {
+            "result": {
+                "status": "ok",
+                "chunks": [
+                    {
+                        "structured_ok": True,
+                        "structured_result": {
+                            "answer": "ok",
+                            "findings": [],
+                            "uncertainty": [],
+                            "suggested_codex_checks": [],
+                        },
+                    }
+                ],
+            }
+        }
+
+        code, output = self.delegate.normalize_mcp_delegate_output(
+            args,
+            json.dumps(envelope),
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output)["answer"], "ok")
+
+    def test_mcp_envelope_setup_error_maps_to_nonzero_exit_code(self):
+        code, output = self.delegate.normalize_mcp_delegate_output(
+            self.args(),
+            json.dumps({"result": {"status": "setup_error", "warnings": ["bad"]}}),
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("setup_error", output)
 
     def test_missing_required_headings_ignores_fenced_code(self):
         output = "\n".join(
@@ -413,6 +514,17 @@ class DeepSeekDelegateTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "no delegate/review MCP tool"):
                 self.delegate.resolve_driver(args, None)
 
+    def test_mcp_probe_uses_short_probe_timeout_not_delegate_timeout(self):
+        args = self.args()
+        args.driver = "auto"
+        args.timeout_seconds = 360
+        args.mcp_probe_timeout_seconds = 5
+
+        with mock.patch.object(self.delegate, "list_mcp_tools", return_value=[]) as probe:
+            self.delegate.resolve_driver(args, None)
+
+        probe.assert_called_once_with(None, 5)
+
     def test_windows_command_limit_keeps_cmd_conservative(self):
         self.assertEqual(self.delegate.windows_command_limit(["cmd.exe"]), 7800)
 
@@ -459,6 +571,23 @@ class DeepSeekDelegateTests(unittest.TestCase):
         )
 
         self.assertEqual(result["error"]["code"], -32601)
+
+    def test_local_mcp_wrapper_returns_envelope_for_helper_timeout(self):
+        with mock.patch.object(
+            self.delegate_mcp.subprocess,
+            "run",
+            side_effect=self.delegate_mcp.subprocess.TimeoutExpired(["python"], 60),
+        ):
+            result = self.delegate_mcp.run_delegate_review({"task": "Review packet."})
+
+        self.assertEqual(result["result"]["status"], "timeout")
+        self.assertEqual(result["result"]["exit_code"], 124)
+
+    def test_local_mcp_wrapper_returns_envelope_for_bad_arguments(self):
+        result = self.delegate_mcp.run_delegate_review({"context_text": "missing task"})
+
+        self.assertEqual(result["result"]["status"], "setup_error")
+        self.assertEqual(result["result"]["exit_code"], 2)
 
 
 if __name__ == "__main__":

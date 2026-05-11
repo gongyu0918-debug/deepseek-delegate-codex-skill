@@ -25,6 +25,25 @@ def response(request_id: Any, result: Any = None, error: dict | None = None) -> 
     return payload
 
 
+def helper_envelope(
+    status: str,
+    exit_code: int,
+    warning: str,
+    raw_stdout: str = "",
+    raw_stderr: str = "",
+) -> dict:
+    return {
+        "result": {
+            "status": status,
+            "driver": "mcp-wrapper",
+            "exit_code": exit_code,
+            "warnings": [warning],
+        },
+        "raw_stdout": raw_stdout,
+        "raw_stderr": raw_stderr,
+    }
+
+
 def tool_schema() -> dict:
     return {
         "name": TOOL_NAME,
@@ -123,8 +142,13 @@ def build_delegate_payload(arguments: dict) -> tuple[dict, int]:
 
 
 def run_delegate_review(arguments: dict) -> dict:
-    payload, timeout_seconds = build_delegate_payload(arguments)
+    try:
+        payload, timeout_seconds = build_delegate_payload(arguments)
+    except Exception as exc:
+        return helper_envelope("setup_error", 2, str(exc))
+
     tmp_path: pathlib.Path | None = None
+    result: subprocess.CompletedProcess[str] | None = None
     try:
         with tempfile.NamedTemporaryFile(
             "w",
@@ -145,6 +169,16 @@ def run_delegate_review(arguments: dict) -> dict:
             capture_output=True,
             timeout=max(60, timeout_seconds * 4),
         )
+    except subprocess.TimeoutExpired as exc:
+        return helper_envelope(
+            "timeout",
+            124,
+            f"helper timed out after {max(60, timeout_seconds * 4)} seconds",
+            str(exc.stdout or ""),
+            str(exc.stderr or ""),
+        )
+    except OSError as exc:
+        return helper_envelope("setup_error", 127, str(exc))
     finally:
         if tmp_path is not None:
             try:
@@ -152,22 +186,21 @@ def run_delegate_review(arguments: dict) -> dict:
             except OSError:
                 pass
 
+    if result is None:
+        return helper_envelope("setup_error", 1, "helper did not start")
     output = result.stdout.strip()
     if output:
         try:
             return json.loads(output)
         except json.JSONDecodeError:
             pass
-    return {
-        "result": {
-            "status": "setup_error",
-            "driver": "mcp-wrapper",
-            "exit_code": result.returncode,
-            "warnings": ["helper did not return a valid JSON envelope"],
-        },
-        "raw_stdout": result.stdout,
-        "raw_stderr": result.stderr,
-    }
+    return helper_envelope(
+        "setup_error",
+        result.returncode,
+        "helper did not return a valid JSON envelope",
+        result.stdout,
+        result.stderr,
+    )
 
 
 def handle_request(
