@@ -38,6 +38,7 @@ Default to the installed helper with a JSON request file for larger packets. Use
 ```powershell
 python "$env:USERPROFILE\.codex\skills\deepseek-delegate\scripts\deepseek_delegate.py" `
   --input-json .\packet.deepseek.json `
+  --driver exec `
   --structured-result `
   --json-result `
   --out .\deepseek-review.md

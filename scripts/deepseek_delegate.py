@@ -138,26 +138,103 @@ class DelegateArgumentParser(argparse.ArgumentParser):
         raise DelegateArgumentError(message)
 
 
-SENSITIVE_PATTERNS = [
+SENSITIVE_LITERAL_PATTERNS = [
     re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_-]{15,}\b"),
     re.compile(r"\bghp_[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b", re.IGNORECASE),
     re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b"),
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-    re.compile(
-        r"\b[A-Z0-9_]*(DATABASE_URL|DB_URL|POSTGRES_URL|MYSQL_URL|REDIS_URL)[A-Z0-9_]*\s*[:=]\s*"
-        r"[^ \t\r\n]*://[^ \t\r\n:/]+:[^ \t\r\n@]+@[^ \t\r\n]+",
-        re.IGNORECASE,
+]
+
+DATABASE_URL_PATTERN = re.compile(
+    r"\b[A-Z0-9_]*(DATABASE_URL|DB_URL|POSTGRES_URL|MYSQL_URL|REDIS_URL)[A-Z0-9_]*\s*[:=]\s*"
+    r"[^ \t\r\n]*://[^ \t\r\n:/]+:([^ \t\r\n@]+)@[^ \t\r\n]+",
+    re.IGNORECASE,
+)
+CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
+    r"\b[A-Z0-9_]*("
+    r"api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|"
+    r"bearer[_-]?token|session[_-]?token|password|secret|cookie"
+    r")[A-Z0-9_]*\s*[:=]\s*"
+    r"(\"[^\"]+\"|'[^']+'|[^\s\"']+)",
+    re.IGNORECASE,
+)
+AUTHORIZATION_PATTERN = re.compile(
+    r"\bauthorization\s*:\s*(bearer|basic)\s+([A-Za-z0-9._~+/\-=]{8,})",
+    re.IGNORECASE,
+)
+PLACEHOLDER_MARKERS = (
+    "redacted",
+    "example",
+    "placeholder",
+    "dummy",
+    "sample",
+    "test",
+    "fake",
+    "changeme",
+    "your_",
+    "your-",
+    "xxx",
+    "****",
+    "<",
+    ">",
+    "...",
+)
+
+
+def strip_credential_value(value: str) -> str:
+    return value.strip().strip(",;").strip("\"'")
+
+
+def looks_like_placeholder(value: str) -> bool:
+    normalized = strip_credential_value(value).strip()
+    lower = normalized.lower()
+    return (
+        not normalized
+        or lower in {"none", "null", "true", "false"}
+        or any(marker in lower for marker in PLACEHOLDER_MARKERS)
+        or normalized.startswith(("$", "%", "{", "[", "("))
+    )
+
+
+def looks_like_secret_value(value: str) -> bool:
+    normalized = strip_credential_value(value)
+    if looks_like_placeholder(normalized) or len(normalized) < 16:
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9._~+/\-=]+", normalized):
+        return False
+    has_alpha = bool(re.search(r"[A-Za-z]", normalized))
+    has_digit = bool(re.search(r"\d", normalized))
+    has_symbol = bool(re.search(r"[._~+/\-=]", normalized))
+    return has_alpha and has_digit and (has_symbol or len(set(normalized)) >= 10)
+
+
+def credential_match_is_sensitive(match: re.Match[str]) -> bool:
+    return looks_like_secret_value(match.group(2))
+
+
+def database_url_match_is_sensitive(match: re.Match[str]) -> bool:
+    password = match.group(2)
+    return not looks_like_placeholder(password)
+
+
+SENSITIVE_MATCHERS = [
+    (pattern, lambda _match: True)
+    for pattern in SENSITIVE_LITERAL_PATTERNS
+] + [
+    (
+        DATABASE_URL_PATTERN,
+        database_url_match_is_sensitive,
     ),
-    re.compile(
-        r"\b[A-Z0-9_]*(api[_-]?key|token|password|secret|cookie)[A-Z0-9_]*\s*[:=]\s*"
-        r"(\"[^\"]{8,}\"|'[^']{8,}'|[^\s\"']{8,})",
-        re.IGNORECASE,
+    (
+        CREDENTIAL_ASSIGNMENT_PATTERN,
+        credential_match_is_sensitive,
     ),
-    re.compile(r"\bauthorization\s*:\s*(bearer|basic)\s+[A-Za-z0-9._~+/\-=]{8,}", re.IGNORECASE),
-    re.compile(r"\b(DEEPSEEK_API_KEY|ANTHROPIC_API_KEY|OPENAI_API_KEY)\s*=", re.IGNORECASE),
-    re.compile(r'"cookies"\s*:\s*{', re.IGNORECASE),
+    (
+        AUTHORIZATION_PATTERN,
+        credential_match_is_sensitive,
+    ),
 ]
 
 MODE_GUIDANCE = {
@@ -226,8 +303,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--driver",
         choices=DRIVER_CHOICES,
-        default="auto",
-        help="Agent-call transport. auto probes MCP and falls back to exec when no delegate tool is exposed.",
+        default="exec",
+        help="Agent-call transport. exec is the default; auto probes MCP first and falls back to exec.",
     )
     parser.add_argument(
         "--provider",
@@ -458,7 +535,7 @@ def fallback_args_for_setup_error(partial: argparse.Namespace | None = None) -> 
         packet_profile="default",
         model="deepseek-v4-pro",
         provider="deepseek",
-        driver=raw_argv_option_value("--driver") or "auto",
+        driver=raw_argv_option_value("--driver") or "exec",
         backend_transport=raw_argv_option_value("--backend-transport") or "auto",
         context_text=None,
         context_file=[],
@@ -596,8 +673,10 @@ def assemble_context(args: argparse.Namespace, base_dir: pathlib.Path | None = N
 
 
 def reject_sensitive_text(text: str, source: str) -> None:
-    for pattern in SENSITIVE_PATTERNS:
-        if pattern.search(text):
+    for pattern, is_sensitive in SENSITIVE_MATCHERS:
+        for match in pattern.finditer(text):
+            if not is_sensitive(match):
+                continue
             raise DelegateSetupError(
                 "sensitive-looking content detected in "
                 f"{source}; refusing to pass it to DeepSeek Delegate"

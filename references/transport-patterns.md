@@ -6,8 +6,8 @@ Load this file when changing JSON input, MCP wrapper behavior, backend prompt tr
 
 - Prefer `--input-json <file>` for normal automation. It moves `task`, packet text, file list, and options out of the shell command line.
 - Keep `--json-result --structured-result` for machine-readable review output.
-- Keep `--driver auto` unless explicitly testing MCP fail-closed behavior.
-- Keep MCP discovery short. `--mcp-probe-timeout-seconds` is separate from the real delegate timeout so auto fallback does not hang on `tools/list`.
+- Keep `--driver exec` for normal automation. Use `--driver auto` only when explicitly testing a real MCP delegate/review tool.
+- If `--driver auto` is used, keep MCP discovery short. `--mcp-probe-timeout-seconds` is separate from the real delegate timeout so auto fallback does not hang on `tools/list`.
 
 Example request:
 
@@ -41,6 +41,7 @@ Do not register this wrapper as a broad always-on MCP suite. A single narrow too
 ## Backend Transport
 
 - Current default: `exec-argv`, because local `deepseek v0.8.26` exposes `deepseek exec [ARGS]...`.
+- Current driver default: `exec`, because local DeepSeek MCP probing does not expose a delegate/review tool and unnecessarily starts another DeepSeek process.
 - Reserved only: `exec-file` and `exec-stdin`. Enable them only after `deepseek exec --help` advertises prompt-file or stdin support.
 - Existing DeepSeek MCP probing remains valid only when `deepseek mcp-server` exposes a real delegate/review tool through `tools/list`.
 

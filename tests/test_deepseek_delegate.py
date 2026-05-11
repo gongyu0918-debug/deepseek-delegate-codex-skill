@@ -193,6 +193,16 @@ class DeepSeekDelegateTests(unittest.TestCase):
         self.assertEqual(args.task, "Review stdin packet.")
         self.assertEqual(args.context_text, "stdin text")
 
+    def test_parse_args_defaults_to_exec_driver(self):
+        with mock.patch.object(
+            self.delegate.sys,
+            "argv",
+            ["deepseek_delegate.py", "--task", "Review packet."],
+        ):
+            args = self.delegate.parse_args()
+
+        self.assertEqual(args.driver, "exec")
+
     def test_input_json_rejects_invalid_json_and_missing_task(self):
         with mock.patch.object(
             self.delegate.sys,
@@ -230,7 +240,7 @@ class DeepSeekDelegateTests(unittest.TestCase):
 
     def test_assemble_context_rejects_sensitive_context_text(self):
         args = self.args()
-        args.context_text = "api_key=redacted-example-value"
+        args.context_text = "OPENAI_API_KEY=sk-abcdefghijklmnop1234567890"
 
         with self.assertRaises(self.delegate.DelegateSetupError):
             self.delegate.assemble_context(args, None)
@@ -489,8 +499,35 @@ class DeepSeekDelegateTests(unittest.TestCase):
     def test_sensitive_text_rejects_secret_like_context(self):
         with self.assertRaises(self.delegate.DelegateSetupError):
             self.delegate.reject_sensitive_text(
-                "api_key=redacted-example-value", "unit test"
+                "api_key=abc123def456ghi789jkl012", "unit test"
             )
+
+    def test_sensitive_text_allows_benign_token_variables(self):
+        self.delegate.reject_sensitive_text(
+            'tokens = {compact[i : i + 2] for i in range(len(compact) - 1)}',
+            "unit test",
+        )
+        self.delegate.reject_sensitive_text(
+            "api_key=redacted-example-value\nOPENAI_API_KEY=<your key here>",
+            "unit test",
+        )
+
+    def test_sensitive_text_rejects_explicit_access_token(self):
+        with self.assertRaises(self.delegate.DelegateSetupError):
+            self.delegate.reject_sensitive_text(
+                "access_token=abc123def456ghi789jkl012", "unit test"
+            )
+
+    def test_sensitive_text_rejects_real_auth_header(self):
+        with self.assertRaises(self.delegate.DelegateSetupError):
+            self.delegate.reject_sensitive_text(
+                "authorization: Bearer abc123def456ghi789jkl012", "unit test"
+            )
+
+    def test_sensitive_text_allows_placeholder_auth_header(self):
+        self.delegate.reject_sensitive_text(
+            "authorization: Bearer redacted-example-value", "unit test"
+        )
 
     def test_mcp_driver_fails_closed_when_no_delegate_tool_exists(self):
         args = self.args()

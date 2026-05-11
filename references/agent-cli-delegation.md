@@ -29,7 +29,7 @@ Load this file when changing transport behavior or comparing DeepSeek Delegate w
 
 - Codex is the supervisor and owns final judgment, file writes, validators, and user-facing synthesis.
 - DeepSeek receives only one task-local packet and returns advisory findings.
-- Current local status: `deepseek mcp-server` starts, but `tools/list` exposes no delegate/review tool, so `--driver auto` falls back to `exec`.
+- Current local status: `deepseek mcp-server` starts, but `tools/list` exposes no delegate/review tool. Use `--driver exec` by default and reserve `--driver auto` for explicit MCP testing.
 - `--driver mcp` must fail closed if no delegate/review tool is exposed.
 - `--input-json` should be the normal automation entry for larger packets.
 - Optional local MCP wrapper use must stay one-tool and narrow; do not install a broad DeepSeek command bridge for this skill.
