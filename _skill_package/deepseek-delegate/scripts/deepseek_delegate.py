@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Iterable
@@ -64,10 +65,45 @@ Use an empty findings array only when there are no concrete findings.
 
 
 DRIVER_CHOICES = ("auto", "exec", "mcp")
+BACKEND_TRANSPORT_CHOICES = ("auto", "exec-argv", "exec-file", "exec-stdin")
+PROMPT_LIMITED_BACKENDS = ("exec-argv",)
 MCP_TOOL_NAME_KEYWORDS = ("delegate", "review")
 MCP_TOOL_BLOCKLIST_KEYWORDS = ("shell", "exec", "command", "terminal", "process")
 MCP_DELEGATE_INPUT_FIELDS = ("prompt", "task", "instructions")
 MCP_PROTOCOL_VERSION = "2025-03-26"
+INPUT_JSON_FIELD_MAP = {
+    "task": "task",
+    "mode": "mode",
+    "packet_profile": "packet_profile",
+    "profile": "packet_profile",
+    "context_text": "context_text",
+    "context_files": "context_file",
+    "context_file": "context_file",
+    "cwd": "cwd",
+    "driver": "driver",
+    "provider": "provider",
+    "model": "model",
+    "sandbox_mode": "sandbox_mode",
+    "approval_policy": "approval_policy",
+    "max_context_chars": "max_context_chars",
+    "timeout_seconds": "timeout_seconds",
+    "prompt_char_limit": "prompt_char_limit",
+    "chunk_chars": "chunk_chars",
+    "chunk_boundary_regex": "chunk_boundary_regex",
+    "max_findings_per_chunk": "max_findings_per_chunk",
+    "out": "out",
+    "json_result": "json_result",
+    "structured_result": "structured_result",
+    "backend_transport": "backend_transport",
+}
+INT_FIELDS = {
+    "max_context_chars",
+    "timeout_seconds",
+    "prompt_char_limit",
+    "chunk_chars",
+    "max_findings_per_chunk",
+}
+BOOL_FIELDS = {"json_result", "structured_result"}
 
 
 class DelegateSetupError(Exception):
@@ -151,6 +187,14 @@ PROFILE_DEFAULTS = {
 }
 
 
+CHOICE_FIELDS = {
+    "mode": tuple(sorted(MODE_GUIDANCE)),
+    "packet_profile": tuple(sorted(PROFILE_DEFAULTS)),
+    "driver": DRIVER_CHOICES,
+    "backend_transport": BACKEND_TRANSPORT_CHOICES,
+}
+
+
 WEIBO_CONTRACT = """Weibo-specific rules:
 - Treat candidate ids, original_url, source_tail, title/topic shells, and immutable_blocks as evidence anchors.
 - Do not smooth over missing source binding, source_tail drift, original URL mismatch, or changed immutable blocks.
@@ -165,7 +209,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Call deepseek exec with a compact delegation packet."
     )
-    parser.add_argument("--task", required=True, help="Bounded task for DeepSeek.")
+    parser.add_argument(
+        "--input-json",
+        default=None,
+        help="Read delegate request JSON from this file, or '-' for stdin.",
+    )
+    parser.add_argument("--task", default=None, help="Bounded task for DeepSeek.")
     parser.add_argument(
         "--packet-profile",
         choices=sorted(PROFILE_DEFAULTS),
@@ -183,6 +232,11 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         help="File whose contents should be included in the packet. Repeat as needed.",
+    )
+    parser.add_argument(
+        "--context-text",
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--cwd", default=None, help="Working directory for deepseek exec.")
     parser.add_argument(
@@ -210,6 +264,15 @@ def parse_args() -> argparse.Namespace:
         "--approval-policy",
         default="never",
         help="Approval policy for delegated CLI calls. Keep never for non-interactive Codex delegation.",
+    )
+    parser.add_argument(
+        "--backend-transport",
+        choices=BACKEND_TRANSPORT_CHOICES,
+        default="auto",
+        help=(
+            "DeepSeek exec prompt transport. auto currently resolves to exec-argv; "
+            "exec-file/stdin are reserved until deepseek exec exposes prompt-file or stdin support."
+        ),
     )
     parser.add_argument(
         "--max-context-chars",
@@ -258,9 +321,108 @@ def parse_args() -> argparse.Namespace:
         help="Ask DeepSeek for a strict JSON findings object and validate it in the result envelope.",
     )
     args = parser.parse_args()
+    args._input_json_fields = set()
+    args.input_transport = "cli"
+    args._resolved_backend_transport = None
+    args._single_packet_attempted = False
+    args._chunk_reason = None
+    apply_input_json(args, parser)
+    if not args.task:
+        parser.error("--task is required unless supplied by --input-json")
     apply_profile_defaults(args)
     validate_provider_model(args, parser)
     return args
+
+
+def apply_input_json(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if not args.input_json:
+        return
+
+    if args.input_json == "-":
+        raw = sys.stdin.read()
+        args.input_transport = "json-stdin"
+    else:
+        input_path = pathlib.Path(args.input_json).expanduser()
+        try:
+            raw = input_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            parser.error(f"cannot read --input-json {args.input_json!r}: {exc}")
+        args.input_transport = "json-file"
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        parser.error(f"--input-json is not valid JSON: {exc.msg}")
+    if not isinstance(payload, dict):
+        parser.error("--input-json root must be a JSON object")
+
+    options = payload.get("options", {})
+    if options is None:
+        options = {}
+    if not isinstance(options, dict):
+        parser.error("--input-json field 'options' must be an object when present")
+
+    for source in (payload, options):
+        for key, value in source.items():
+            if key == "options":
+                continue
+            field = INPUT_JSON_FIELD_MAP.get(key)
+            if field is None:
+                continue
+            apply_input_json_field(args, parser, field, value)
+
+
+def apply_input_json_field(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    field: str,
+    value: object,
+) -> None:
+    if field == "context_file":
+        if value is None:
+            normalized: list[str] = []
+        elif isinstance(value, str):
+            normalized = [value]
+        elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+            normalized = list(value)
+        else:
+            parser.error("--input-json context_files must be a string or string array")
+        if not field_was_supplied_by_cli(field):
+            args.context_file = normalized
+            args._input_json_fields.add(field)
+        return
+
+    if field in BOOL_FIELDS and not isinstance(value, bool):
+        parser.error(f"--input-json field {field!r} must be a boolean")
+    if field in INT_FIELDS:
+        if not isinstance(value, int) or isinstance(value, bool):
+            parser.error(f"--input-json field {field!r} must be an integer")
+    string_fields = {
+        "task",
+        "context_text",
+        "cwd",
+        "provider",
+        "model",
+        "sandbox_mode",
+        "approval_policy",
+        "chunk_boundary_regex",
+        "out",
+    }
+    nullable_string_fields = {"context_text", "cwd", "chunk_boundary_regex", "out"}
+    if field in string_fields:
+        if value is None and field not in nullable_string_fields:
+            parser.error(f"--input-json field {field!r} must be a string")
+        if value is not None and not isinstance(value, str):
+            parser.error(f"--input-json field {field!r} must be a string")
+    choices = CHOICE_FIELDS.get(field)
+    if choices and value not in choices:
+        parser.error(
+            f"--input-json field {field!r} must be one of: " + ", ".join(choices)
+        )
+
+    if not field_was_supplied_by_cli(field):
+        setattr(args, field, value)
+        args._input_json_fields.add(field)
 
 
 def option_was_supplied(*names: str) -> bool:
@@ -272,18 +434,25 @@ def option_was_supplied(*names: str) -> bool:
     )
 
 
+def field_was_supplied_by_cli(field: str) -> bool:
+    return option_was_supplied("--" + field.replace("_", "-"))
+
+
+def field_was_supplied(args: argparse.Namespace, field: str) -> bool:
+    return field_was_supplied_by_cli(field) or field in getattr(args, "_input_json_fields", set())
+
+
 def apply_profile_defaults(args: argparse.Namespace) -> None:
     defaults = PROFILE_DEFAULTS.get(args.packet_profile, {})
     for field, value in defaults.items():
-        option = "--" + field.replace("_", "-")
         if (
             field == "model"
-            and option_was_supplied("--provider")
+            and field_was_supplied(args, "provider")
             and args.provider != "deepseek"
-            and not option_was_supplied("--model")
+            and not field_was_supplied(args, "model")
         ):
             continue
-        if not option_was_supplied(option):
+        if not field_was_supplied(args, field):
             setattr(args, field, value)
 
 
@@ -340,6 +509,46 @@ def read_context_files(
                 ]
             )
         )
+
+    if not sections:
+        return "No context files were provided."
+    return "\n\n".join(sections)
+
+
+def assemble_context(args: argparse.Namespace, base_dir: pathlib.Path | None = None) -> str:
+    if args.max_context_chars < 0:
+        raise DelegateSetupError("--max-context-chars must be non-negative")
+
+    sections: list[str] = []
+    remaining = args.max_context_chars
+    if args.context_text is not None:
+        reject_sensitive_text(args.context_text, "input-json context_text")
+        original_len = len(args.context_text)
+        if remaining <= 0:
+            excerpt = ""
+            truncated = True
+        else:
+            excerpt = args.context_text[:remaining]
+            truncated = original_len > len(excerpt)
+            remaining -= len(excerpt)
+        marker = ""
+        if truncated:
+            marker = f"\n[truncated: original {original_len} chars]"
+        sections.append(
+            "\n".join(
+                [
+                    "### Context text: input-json",
+                    "```",
+                    excerpt,
+                    f"```{marker}",
+                ]
+            )
+        )
+
+    if args.context_file:
+        file_context = read_context_files(args.context_file, remaining, base_dir)
+        if file_context != "No context files were provided.":
+            sections.append(file_context)
 
     if not sections:
         return "No context files were provided."
@@ -487,7 +696,12 @@ def deepseek_executable() -> str | None:
     return shutil.which("deepseek")
 
 
-def deepseek_invocation(args: argparse.Namespace, prompt: str) -> list[str]:
+def deepseek_invocation(
+    args: argparse.Namespace,
+    prompt: str,
+    backend_transport: str = "exec-argv",
+    prompt_path: pathlib.Path | None = None,
+) -> list[str]:
     found = deepseek_executable()
     common_args = [
         "--provider",
@@ -499,8 +713,17 @@ def deepseek_invocation(args: argparse.Namespace, prompt: str) -> list[str]:
         "--approval-policy",
         args.approval_policy,
     ]
+    if backend_transport == "exec-file":
+        if prompt_path is None:
+            raise DelegateSetupError("exec-file backend requires a prompt file path")
+        exec_args = ["exec", "--prompt-file", str(prompt_path)]
+    elif backend_transport == "exec-stdin":
+        exec_args = ["exec", "--stdin"]
+    else:
+        exec_args = ["exec", prompt]
+
     if not found:
-        return ["deepseek", *common_args, "exec", prompt]
+        return ["deepseek", *common_args, *exec_args]
 
     suffix = pathlib.Path(found).suffix.lower()
     if os.name == "nt":
@@ -513,16 +736,14 @@ def deepseek_invocation(args: argparse.Namespace, prompt: str) -> list[str]:
                 "-File",
                 found,
                 *common_args,
-                "exec",
-                prompt,
+                *exec_args,
             ]
         if suffix in {".cmd", ".bat"}:
             command_line = subprocess.list2cmdline(
                 [
                     found,
                     *common_args,
-                    "exec",
-                    prompt,
+                    *exec_args,
                 ]
             )
             return ["cmd.exe", "/d", "/s", "/c", command_line]
@@ -530,8 +751,7 @@ def deepseek_invocation(args: argparse.Namespace, prompt: str) -> list[str]:
     return [
         found,
         *common_args,
-        "exec",
-        prompt,
+        *exec_args,
     ]
 
 
@@ -540,6 +760,63 @@ def deepseek_mcp_invocation() -> list[str]:
     if not found:
         return ["deepseek", "mcp-server"]
     return [found, "mcp-server"]
+
+
+def deepseek_exec_supports_transport(backend_transport: str) -> bool:
+    if backend_transport == "exec-argv":
+        return True
+    found = deepseek_executable()
+    invocation = [found or "deepseek", "exec", "--help"]
+    try:
+        result = subprocess.run(
+            invocation,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=8,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    help_text = result.stdout + "\n" + result.stderr
+    if backend_transport == "exec-file":
+        return "--prompt-file" in help_text or "--file" in help_text
+    if backend_transport == "exec-stdin":
+        return "--stdin" in help_text or "-f, --file" in help_text
+    return False
+
+
+def resolve_backend_transport(args: argparse.Namespace, driver: str) -> str:
+    if driver == "mcp":
+        if args.backend_transport not in {"auto", "exec-argv"}:
+            raise DelegateSetupError(
+                "--backend-transport applies only to the exec driver, not --driver mcp"
+            )
+        return "mcp-stdio"
+
+    requested = args.backend_transport
+    if requested == "auto":
+        return "exec-argv"
+    if requested == "exec-argv":
+        return "exec-argv"
+    if requested in {"exec-file", "exec-stdin"}:
+        if deepseek_exec_supports_transport(requested):
+            return requested
+        raise DelegateSetupError(
+            f"backend transport {requested} is reserved, but this deepseek exec "
+            "does not advertise prompt-file/stdin support"
+        )
+    raise DelegateSetupError(f"unknown backend transport: {requested}")
+
+
+def backend_prompt_has_command_limit(backend_transport: str) -> bool:
+    return backend_transport in PROMPT_LIMITED_BACKENDS
+
+
+def backend_allows_single_packet(args: argparse.Namespace, prompt: str, backend_transport: str) -> bool:
+    if not backend_prompt_has_command_limit(backend_transport):
+        return True
+    return len(prompt) <= args.prompt_char_limit
 
 
 def mcp_send(proc: subprocess.Popen[str], payload: dict) -> None:
@@ -907,8 +1184,12 @@ def parse_structured_result(output: str) -> tuple[dict | None, list[str]]:
     return value, []
 
 
-def validate_delegate_prompt(args: argparse.Namespace, prompt: str) -> None:
-    if len(prompt) > args.prompt_char_limit:
+def validate_delegate_prompt(
+    args: argparse.Namespace,
+    prompt: str,
+    backend_transport: str,
+) -> None:
+    if backend_prompt_has_command_limit(backend_transport) and len(prompt) > args.prompt_char_limit:
         raise DelegateSetupError(
             f"prompt chars={len(prompt)} exceeds --prompt-char-limit={args.prompt_char_limit}; "
             "lower --chunk-chars or reduce --max-context-chars"
@@ -921,22 +1202,51 @@ def call_deepseek_exec_driver(
     prompt: str,
     cwd: str | None,
     timeout_seconds: int,
+    backend_transport: str,
 ) -> tuple[int, str]:
-    invocation = deepseek_invocation(args, prompt)
-    if os.name == "nt" and len(subprocess.list2cmdline(invocation)) > windows_command_limit(invocation):
-        raise DelegateSetupError(
-            "estimated Windows command line exceeds conservative Windows limit; "
-            "lower --chunk-chars, shorten --task, or reduce --max-context-chars"
+    prompt_path: pathlib.Path | None = None
+    run_input: str | None = None
+    try:
+        if backend_transport == "exec-file":
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                errors="replace",
+                suffix=".deepseek-prompt.txt",
+                delete=False,
+            ) as handle:
+                handle.write(prompt)
+                prompt_path = pathlib.Path(handle.name)
+        elif backend_transport == "exec-stdin":
+            run_input = prompt
+
+        invocation = deepseek_invocation(
+            args,
+            prompt if backend_transport == "exec-argv" else "",
+            backend_transport,
+            prompt_path,
         )
-    result = subprocess.run(
-        invocation,
-        cwd=cwd,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        capture_output=True,
-        timeout=timeout_seconds,
-    )
+        if os.name == "nt" and len(subprocess.list2cmdline(invocation)) > windows_command_limit(invocation):
+            raise DelegateSetupError(
+                "estimated Windows command line exceeds conservative Windows limit; "
+                "lower --chunk-chars, shorten --task, or reduce --max-context-chars"
+            )
+        result = subprocess.run(
+            invocation,
+            cwd=cwd,
+            input=run_input,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=timeout_seconds,
+        )
+    finally:
+        if prompt_path is not None:
+            try:
+                prompt_path.unlink()
+            except OSError:
+                pass
     output = result.stdout
     if result.stderr:
         output = output.rstrip() + "\n\n[stderr]\n" + result.stderr
@@ -949,18 +1259,26 @@ def call_deepseek_with_metadata(
     cwd: str | None,
     timeout_seconds: int,
     driver: str,
+    backend_transport: str,
     mcp_tool: dict | None = None,
 ) -> dict:
-    validate_delegate_prompt(args, prompt)
+    validate_delegate_prompt(args, prompt, backend_transport)
     start = time.monotonic()
     warnings: list[str] = []
     if driver == "mcp":
         code, output = call_deepseek_mcp_driver(args, prompt, cwd, mcp_tool)
     else:
-        code, output = call_deepseek_exec_driver(args, prompt, cwd, timeout_seconds)
+        code, output = call_deepseek_exec_driver(
+            args,
+            prompt,
+            cwd,
+            timeout_seconds,
+            backend_transport,
+        )
     duration = time.monotonic() - start
     return {
         "driver": driver,
+        "backend_transport": backend_transport,
         "exit_code": code,
         "output": output,
         "duration_seconds": round(duration, 3),
@@ -974,7 +1292,14 @@ def call_deepseek(
     cwd: str | None,
     timeout_seconds: int,
 ) -> tuple[int, str]:
-    call = call_deepseek_with_metadata(args, prompt, cwd, timeout_seconds, "exec")
+    call = call_deepseek_with_metadata(
+        args,
+        prompt,
+        cwd,
+        timeout_seconds,
+        "exec",
+        resolve_backend_transport(args, "exec"),
+    )
     return int(call["exit_code"]), str(call["output"])
 
 
@@ -992,11 +1317,13 @@ def request_envelope(args: argparse.Namespace, cwd: str | None) -> dict:
         "task": args.task,
         "mode": args.mode,
         "profile": args.packet_profile,
+        "input_transport": getattr(args, "input_transport", "cli"),
         "provider": args.provider,
         "model": args.model,
         "cwd": cwd,
         "context_files": list(args.context_file),
         "driver": args.driver,
+        "backend_transport_request": getattr(args, "backend_transport", "auto"),
         "chunk_policy": {
             "chunk_chars": args.chunk_chars,
             "chunk_boundary_regex": args.chunk_boundary_regex,
@@ -1031,6 +1358,10 @@ def make_result_envelope(
         "result": {
             "status": status,
             "driver": driver or args.driver,
+            "input_transport": getattr(args, "input_transport", "cli"),
+            "backend_transport": getattr(args, "_resolved_backend_transport", None),
+            "single_packet_attempted": bool(getattr(args, "_single_packet_attempted", False)),
+            "chunk_reason": getattr(args, "_chunk_reason", None),
             "model": args.model,
             "chunks": chunks,
             "exit_code": exit_code,
@@ -1090,6 +1421,7 @@ def chunk_result(
         "chunk_id": chunk_id,
         "status": status,
         "driver": call["driver"],
+        "backend_transport": call.get("backend_transport"),
         "exit_code": exit_code,
         "headings_checked": headings_checked,
         "headings_ok": headings_ok,
@@ -1147,11 +1479,23 @@ def main() -> int:
             cwd_valid = True
         base_dir = pathlib.Path(cwd) if cwd else None
         reject_sensitive_text(args.task, "task")
-        context = read_context_files(args.context_file, args.max_context_chars, base_dir)
+        context = assemble_context(args, base_dir)
         reject_sensitive_text(context, "assembled context packet")
         selected_driver, driver_warnings, mcp_tool = resolve_driver(args, cwd)
         warnings.extend(driver_warnings)
-        if args.chunk_chars > 0:
+        backend_transport = resolve_backend_transport(args, selected_driver)
+        args._resolved_backend_transport = backend_transport
+        prompt = build_prompt(args, context)
+        if not backend_allows_single_packet(args, prompt, backend_transport):
+            args._single_packet_attempted = False
+            args._chunk_reason = (
+                f"full prompt chars={len(prompt)} exceeds prompt_char_limit="
+                f"{args.prompt_char_limit} for backend_transport={backend_transport}"
+            )
+            if args.chunk_chars <= 0:
+                raise DelegateSetupError(
+                    args._chunk_reason + "; enable --chunk-chars or reduce the packet"
+                )
             chunks = split_text(context, args.chunk_chars, args.chunk_boundary_regex)
             outputs: list[str] = []
             worst_code = 0
@@ -1170,6 +1514,7 @@ def main() -> int:
                     cwd,
                     args.timeout_seconds,
                     selected_driver,
+                    backend_transport,
                     mcp_tool,
                 )
                 code = int(call["exit_code"])
@@ -1237,13 +1582,15 @@ def main() -> int:
             emit_result(args, output, envelope)
             return worst_code
 
-        prompt = build_prompt(args, context)
+        args._single_packet_attempted = True
+        args._chunk_reason = None
         call = call_deepseek_with_metadata(
             args,
             prompt,
             cwd,
             args.timeout_seconds,
             selected_driver,
+            backend_transport,
             mcp_tool,
         )
         returncode = int(call["exit_code"])

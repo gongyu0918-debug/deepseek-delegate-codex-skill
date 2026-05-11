@@ -35,6 +35,13 @@ With `--structured-result`, DeepSeek should return one fenced JSON object:
 For structured mode, schema success is authoritative. Markdown headings are only a compatibility fallback when `--structured-result` is not used.
 In structured mode, chunks report `headings_checked=false`; use `structured_ok` and `structured_errors` instead of legacy heading fields.
 
+The result envelope also reports transport metadata:
+
+- `input_transport`: `cli`, `json-file`, or `json-stdin`.
+- `backend_transport`: `exec-argv`, `exec-file`, `exec-stdin`, or `mcp-stdio`.
+- `single_packet_attempted`: whether the helper attempted one full packet instead of map/reduce chunks.
+- `chunk_reason`: why the packet was split, usually an `exec-argv` prompt-size guard.
+
 ## Codex Acceptance
 
 Codex may use a finding only after it verifies the cited packet evidence or reproduces the suggested check locally. Treat uncited claims, broad advice, style-only rewrites, or findings that depend on missing context as advisory noise.

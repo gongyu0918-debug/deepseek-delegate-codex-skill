@@ -33,17 +33,17 @@ Bad fits:
 
 ## How To Call
 
-Default to the installed helper. Use `--structured-result` for new automation and keep `--json-result` for the machine-readable envelope.
+Default to the installed helper with a JSON request file for larger packets. Use `--structured-result` for new automation and keep `--json-result` for the machine-readable envelope.
 
 ```powershell
 python "$env:USERPROFILE\.codex\skills\deepseek-delegate\scripts\deepseek_delegate.py" `
-  --mode review `
-  --task "Review this small diff for correctness risks. Do not modify files." `
-  --context-file .\packet.md `
+  --input-json .\packet.deepseek.json `
   --structured-result `
   --json-result `
   --out .\deepseek-review.md
 ```
+
+The optional `scripts/deepseek_delegate_mcp.py` wrapper exposes one narrow MCP tool for hosts that require stdio JSON. Do not register it as a broad, always-on agent tool when the CLI JSON path is enough.
 
 If the helper reports `setup_error`, `timeout`, `partial`, missing structured fields, or sensitive-content rejection, shrink or clarify the packet, or do the work in Codex. Treat every finding as a hypothesis until Codex checks the cited evidence.
 
@@ -55,5 +55,6 @@ Load `references/index.md` when the packet type or integration pattern is not ob
 - `references/packet-types.md` for packet shapes and minimum evidence.
 - `references/codex-side-routing.md` for deciding whether Codex should use this skill, native subagents, or no delegate.
 - `references/agent-cli-delegation.md` for MCP, native subagent, and CLI-adapter comparison.
+- `references/transport-patterns.md` for JSON input, MCP wrapper, and long-context transport decisions.
 - `references/chinese-prose.md` for bounded Chinese prose review.
 - `references/weibo-batch.md` and `references/weibo-ablation-index.md` for 01H Weibo ablation or calibration packets.

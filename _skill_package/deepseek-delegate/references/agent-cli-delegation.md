@@ -22,7 +22,8 @@ Load this file when changing transport behavior or comparing DeepSeek Delegate w
 - Native Codex or Codex subagent: repo work, implementation, full-repo review, architecture, parallel workers, or any task that needs integrated workspace context.
 - DeepSeek Delegate: bounded advisory packets where `deepseek-v4-pro` can provide a second opinion from packet evidence only.
 - MCP tool: use only when a real delegate/review tool is exposed through `tools/list`.
-- CLI exec adapter: current default fallback when MCP has no delegate/review tool.
+- CLI JSON adapter: preferred default for this skill because it avoids extra MCP tool-schema overhead while still keeping large packets out of shell argv.
+- CLI exec adapter: backend fallback when MCP has no delegate/review tool and DeepSeek TUI has no prompt-file/stdin support.
 
 ## DeepSeek Delegate Boundary
 
@@ -30,6 +31,8 @@ Load this file when changing transport behavior or comparing DeepSeek Delegate w
 - DeepSeek receives only one task-local packet and returns advisory findings.
 - Current local status: `deepseek mcp-server` starts, but `tools/list` exposes no delegate/review tool, so `--driver auto` falls back to `exec`.
 - `--driver mcp` must fail closed if no delegate/review tool is exposed.
+- `--input-json` should be the normal automation entry for larger packets.
+- Optional local MCP wrapper use must stay one-tool and narrow; do not install a broad DeepSeek command bridge for this skill.
 - `--driver exec` must stay read-only, non-interactive, timeout-bound, and observable through JSON result metadata.
 
 ## Anti-Patterns

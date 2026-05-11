@@ -1,6 +1,9 @@
 import argparse
+import io
 import importlib.util
+import json
 import pathlib
+import tempfile
 import unittest
 from unittest import mock
 
@@ -17,6 +20,13 @@ SCRIPT_PATH = (
     / "scripts"
     / "deepseek_delegate.py"
 )
+MCP_SCRIPT_PATH = (
+    ROOT
+    / "_skill_package"
+    / "deepseek-delegate"
+    / "scripts"
+    / "deepseek_delegate_mcp.py"
+)
 
 
 def load_module():
@@ -27,19 +37,32 @@ def load_module():
     return module
 
 
+def load_mcp_module():
+    spec = importlib.util.spec_from_file_location("deepseek_delegate_mcp", MCP_SCRIPT_PATH)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 class DeepSeekDelegateTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.delegate = load_module()
+        cls.delegate_mcp = load_mcp_module()
 
     def args(self):
         return argparse.Namespace(
+            input_json=None,
+            input_transport="cli",
             task="Review the packet.",
             mode="audit",
             packet_profile="default",
             model="deepseek-v4-pro",
             provider="deepseek",
             driver="auto",
+            backend_transport="auto",
+            context_text=None,
             context_file=[],
             chunk_chars=0,
             chunk_boundary_regex=None,
@@ -52,6 +75,10 @@ class DeepSeekDelegateTests(unittest.TestCase):
             approval_policy="never",
             out=None,
             json_result=False,
+            _input_json_fields=set(),
+            _resolved_backend_transport=None,
+            _single_packet_attempted=False,
+            _chunk_reason=None,
         )
 
     def test_skill_frontmatter_is_parseable_and_trigger_is_narrow(self):
@@ -86,6 +113,7 @@ class DeepSeekDelegateTests(unittest.TestCase):
             "packet-types.md",
             "codex-side-routing.md",
             "agent-cli-delegation.md",
+            "transport-patterns.md",
             "chinese-prose.md",
             "weibo-batch.md",
             "weibo-ablation-index.md",
@@ -130,6 +158,104 @@ class DeepSeekDelegateTests(unittest.TestCase):
         self.assertNotIn("--route-preview", text)
         self.assertNotIn("cost_hint", text)
         self.assertNotIn("selected_model", text)
+
+    def test_input_json_file_populates_request_fields(self):
+        payload = {
+            "task": "Review JSON packet.",
+            "mode": "review",
+            "packet_profile": "long-review",
+            "context_text": "hello",
+            "context_files": ["packet.md"],
+            "options": {
+                "json_result": True,
+                "structured_result": True,
+                "max_context_chars": 1234,
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "packet.deepseek.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with mock.patch.object(
+                self.delegate.sys,
+                "argv",
+                ["deepseek_delegate.py", "--input-json", str(path)],
+            ):
+                args = self.delegate.parse_args()
+
+        self.assertEqual(args.input_transport, "json-file")
+        self.assertEqual(args.task, "Review JSON packet.")
+        self.assertEqual(args.mode, "review")
+        self.assertEqual(args.packet_profile, "long-review")
+        self.assertEqual(args.context_text, "hello")
+        self.assertEqual(args.context_file, ["packet.md"])
+        self.assertTrue(args.json_result)
+        self.assertTrue(args.structured_result)
+        self.assertEqual(args.max_context_chars, 1234)
+
+    def test_input_json_stdin_populates_request_fields(self):
+        payload = {"task": "Review stdin packet.", "context_text": "stdin text"}
+        with mock.patch.object(
+            self.delegate.sys,
+            "argv",
+            ["deepseek_delegate.py", "--input-json", "-"],
+        ):
+            with mock.patch.object(self.delegate.sys, "stdin", io.StringIO(json.dumps(payload))):
+                args = self.delegate.parse_args()
+
+        self.assertEqual(args.input_transport, "json-stdin")
+        self.assertEqual(args.task, "Review stdin packet.")
+        self.assertEqual(args.context_text, "stdin text")
+
+    def test_input_json_rejects_invalid_json_and_missing_task(self):
+        with mock.patch.object(
+            self.delegate.sys,
+            "argv",
+            ["deepseek_delegate.py", "--input-json", "-"],
+        ):
+            with mock.patch.object(self.delegate.sys, "stdin", io.StringIO("{bad")):
+                with self.assertRaises(SystemExit):
+                    self.delegate.parse_args()
+
+        with mock.patch.object(
+            self.delegate.sys,
+            "argv",
+            ["deepseek_delegate.py", "--input-json", "-"],
+        ):
+            with mock.patch.object(self.delegate.sys, "stdin", io.StringIO('{"context_text":"x"}')):
+                with self.assertRaises(SystemExit):
+                    self.delegate.parse_args()
+
+    def test_assemble_context_rejects_sensitive_context_text(self):
+        args = self.args()
+        args.context_text = "API_TOKEN=abcdefghijklmnopqrstuvwxyz"
+
+        with self.assertRaises(self.delegate.DelegateSetupError):
+            self.delegate.assemble_context(args, None)
+
+    def test_reserved_exec_file_and_stdin_invocations_do_not_put_prompt_in_argv(self):
+        args = self.args()
+        prompt = "FULL PROMPT SHOULD NOT BE IN ARGV"
+
+        file_invocation = self.delegate.deepseek_invocation(
+            args,
+            prompt,
+            "exec-file",
+            pathlib.Path("packet.prompt.txt"),
+        )
+        stdin_invocation = self.delegate.deepseek_invocation(args, prompt, "exec-stdin")
+
+        self.assertNotIn(prompt, file_invocation)
+        self.assertNotIn(prompt, stdin_invocation)
+        self.assertIn("--prompt-file", " ".join(file_invocation))
+        self.assertIn("--stdin", " ".join(stdin_invocation))
+
+    def test_resolve_backend_transport_rejects_unadvertised_file_transport(self):
+        args = self.args()
+        args.backend_transport = "exec-file"
+
+        with mock.patch.object(self.delegate, "deepseek_exec_supports_transport", return_value=False):
+            with self.assertRaisesRegex(self.delegate.DelegateSetupError, "reserved"):
+                self.delegate.resolve_backend_transport(args, "exec")
 
     def test_mcp_arguments_use_prompt_field_when_available(self):
         tool = {"inputSchema": {"properties": {"prompt": {}, "task": {}}}}
@@ -289,6 +415,50 @@ class DeepSeekDelegateTests(unittest.TestCase):
 
     def test_windows_command_limit_keeps_cmd_conservative(self):
         self.assertEqual(self.delegate.windows_command_limit(["cmd.exe"]), 7800)
+
+    def test_local_mcp_wrapper_exposes_only_delegate_review_tool(self):
+        result = self.delegate_mcp.handle_request(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        )
+
+        tools = result["result"]["tools"]
+        self.assertEqual([tool["name"] for tool in tools], ["deepseek_delegate_review"])
+        description = tools[0]["description"].lower()
+        self.assertIn("bounded", description)
+        self.assertNotIn("shell", tools[0]["name"])
+        self.assertNotIn("command", tools[0]["name"])
+
+    def test_local_mcp_wrapper_calls_delegate_runner_with_json_arguments(self):
+        def fake_runner(arguments):
+            return {"result": {"status": "ok", "task": arguments["task"]}}
+
+        result = self.delegate_mcp.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "deepseek_delegate_review",
+                    "arguments": {"task": "Review packet.", "context_text": "hello"},
+                },
+            },
+            fake_runner,
+        )
+
+        text = result["result"]["content"][0]["text"]
+        self.assertEqual(json.loads(text)["result"]["status"], "ok")
+
+    def test_local_mcp_wrapper_unknown_tool_fails_closed(self):
+        result = self.delegate_mcp.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "exec_shell", "arguments": {}},
+            }
+        )
+
+        self.assertEqual(result["error"]["code"], -32601)
 
 
 if __name__ == "__main__":
