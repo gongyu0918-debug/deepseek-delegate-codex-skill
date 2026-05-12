@@ -1,6 +1,6 @@
 # Transport Patterns
 
-Load this file when changing JSON input, MCP wrapper behavior, backend prompt transport, or long-context chunking.
+Load this file when changing JSON input, MCP wrapper behavior, or backend prompt transport.
 
 ## Default Path
 
@@ -20,15 +20,14 @@ Example request:
   "context_files": ["packet.md"],
   "options": {
     "structured_result": true,
-    "json_result": true,
-    "chunk_chars": 18000
+    "json_result": true
   }
 }
 ```
 
 ## MCP Wrapper
 
-Use `scripts/deepseek_delegate_mcp.py` only when a host needs stdio JSON tools. It exposes one tool, `deepseek_delegate_review`, and delegates through the same helper.
+Use `scripts/review_helper_mcp.py` only when a host needs stdio JSON tools. It exposes one tool, `codex_review_helper_review`, and delegates through the same helper.
 
 Borrowed community constraints:
 
@@ -40,13 +39,13 @@ Do not register this wrapper as a broad always-on MCP suite. A single narrow too
 
 ## Backend Transport
 
-- Current default: `exec-argv`, because local `deepseek v0.8.26` exposes `deepseek exec [ARGS]...`.
-- Reserved only: `exec-file` and `exec-stdin`. Enable them only after `deepseek exec --help` advertises prompt-file or stdin support.
-- Existing DeepSeek MCP probing remains valid only when `deepseek mcp-server` exposes a real delegate/review tool through `tools/list`.
+- Current default: `exec-argv`, because the current supported CLI exposes only an argv prompt path.
+- Reserved only: `exec-file` and `exec-stdin`. Enable them only after the configured CLI advertises prompt-file or stdin support.
+- MCP probing is valid only when the configured CLI exposes a real delegate/review tool through `tools/list`.
 
-## Long Context
+## Packet Size
 
-- Attempt a single packet first when the backend transport can carry it.
-- With current `exec-argv`, keep the conservative prompt-size guard and chunk only when the full prompt exceeds that guard.
-- Chunk by evidence boundary, not arbitrary byte count. Preserve ids, URLs, paths, timestamps, and source evidence with the claim they support.
-- Treat `chunk_reason` in the JSON envelope as the reason a long packet was split.
+- Attempt one explicit packet only.
+- With current `exec-argv`, keep the conservative prompt-size guard.
+- If a packet is too large, shrink it or keep the review in Codex. Do not fall back to repeated external CLI calls.
+- Treat `chunk_reason` in the JSON envelope as a setup-failure explanation, not permission to batch.

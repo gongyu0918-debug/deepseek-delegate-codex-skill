@@ -3,34 +3,37 @@ import io
 import importlib.util
 import json
 import pathlib
+import shutil
 import tempfile
 import unittest
+import uuid
 from unittest import mock
 
 import yaml
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-SKILL_PATH = ROOT / "_skill_package" / "deepseek-delegate" / "SKILL.md"
-REFERENCE_DIR = ROOT / "_skill_package" / "deepseek-delegate" / "references"
+SKILL_PATH = ROOT / "_skill_package" / "codex-review-helper" / "SKILL.md"
+REFERENCE_DIR = ROOT / "_skill_package" / "codex-review-helper" / "references"
 SCRIPT_PATH = (
     ROOT
     / "_skill_package"
-    / "deepseek-delegate"
+    / "codex-review-helper"
     / "scripts"
-    / "deepseek_delegate.py"
+    / "review_helper.py"
 )
 MCP_SCRIPT_PATH = (
     ROOT
     / "_skill_package"
-    / "deepseek-delegate"
+    / "codex-review-helper"
     / "scripts"
-    / "deepseek_delegate_mcp.py"
+    / "review_helper_mcp.py"
 )
+TEST_TMP_ROOT = ROOT / "tests" / "_runtime_tmp"
 
 
 def load_module():
-    spec = importlib.util.spec_from_file_location("deepseek_delegate", SCRIPT_PATH)
+    spec = importlib.util.spec_from_file_location("review_helper", SCRIPT_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -38,14 +41,27 @@ def load_module():
 
 
 def load_mcp_module():
-    spec = importlib.util.spec_from_file_location("deepseek_delegate_mcp", MCP_SCRIPT_PATH)
+    spec = importlib.util.spec_from_file_location("review_helper_mcp", MCP_SCRIPT_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
 
 
-class DeepSeekDelegateTests(unittest.TestCase):
+def temp_dir():
+    class TempDir:
+        def __enter__(self):
+            self.path = TEST_TMP_ROOT / uuid.uuid4().hex
+            self.path.mkdir(parents=True, exist_ok=False)
+            return str(self.path)
+
+        def __exit__(self, *_exc):
+            shutil.rmtree(self.path, ignore_errors=True)
+
+    return TempDir()
+
+
+class CodexReviewHelperTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.delegate = load_module()
@@ -80,6 +96,7 @@ class DeepSeekDelegateTests(unittest.TestCase):
             _resolved_backend_transport=None,
             _single_packet_attempted=False,
             _chunk_reason=None,
+            _delegate_cwd=None,
         )
 
     def test_skill_frontmatter_is_parseable_and_trigger_is_narrow(self):
@@ -87,42 +104,50 @@ class DeepSeekDelegateTests(unittest.TestCase):
         frontmatter = text.split("---", 2)[1]
         metadata = yaml.safe_load(frontmatter)
 
-        self.assertEqual(metadata["name"], "deepseek-delegate")
+        self.assertEqual(metadata["name"], "codex-review-helper")
         description = metadata["description"]
-        self.assertIn("Pro-only packet-local advisory review", description)
-        self.assertIn("deepseek-v4-pro", description)
-        self.assertIn("bounded snippets, diffs, logs", description)
+        self.assertIn("Single-packet read-only review helper", description)
+        self.assertNotIn("DeepSeek", description)
+        self.assertIn("one bounded snippet, diff, log", description)
         self.assertIn("Do not use for implementation", description)
         self.assertIn("full-repo review", description)
         self.assertIn("architecture", description)
         self.assertIn("secrets", description)
-        self.assertIn("cheap-model routing", description)
-        self.assertLessEqual(len(description.split()), 120)
+        self.assertIn("training/evaluation datasets", description)
+        self.assertIn("bulk or batch delegation", description)
+        self.assertIn("data collection", description)
+        self.assertNotIn("social workflow packets", description)
+        self.assertNotIn("independent review chunks", description)
+        self.assertLessEqual(len(description.split()), 140)
 
-    def test_skill_body_keeps_weibo_detail_out_of_main_instructions(self):
+    def test_skill_body_keeps_batch_and_private_workflow_detail_out(self):
         text = SKILL_PATH.read_text(encoding="utf-8")
 
         self.assertNotIn("source_tail", text)
         self.assertNotIn("immutable_blocks", text)
         self.assertNotIn("QUALITY_GATE", text)
+        self.assertNotIn("map/reduce review", text)
+        self.assertNotIn("social workflow calibration", text)
 
     def test_reference_router_lists_expected_references_without_self_loop(self):
         text = (REFERENCE_DIR / "index.md").read_text(encoding="utf-8")
 
         for name in [
             "result-contract.md",
+            "privacy-boundary.md",
             "packet-types.md",
             "codex-side-routing.md",
             "agent-cli-delegation.md",
             "transport-patterns.md",
             "chinese-prose.md",
-            "weibo-batch.md",
-            "weibo-ablation-index.md",
         ]:
             self.assertIn(name, text)
         self.assertNotIn("- `index.md`", text)
+        self.assertNotIn("batch-workflow.md", text)
+        self.assertNotIn("ablation-index.md", text)
 
     def test_profiles_are_pro_only_by_default(self):
+        self.assertEqual(sorted(self.delegate.PROFILE_DEFAULTS), ["default", "long-review"])
         for profile, defaults in self.delegate.PROFILE_DEFAULTS.items():
             self.assertNotEqual(
                 defaults.get("model"),
@@ -131,19 +156,20 @@ class DeepSeekDelegateTests(unittest.TestCase):
             )
             if "model" in defaults:
                 self.assertEqual(defaults["model"], "deepseek-v4-pro")
+            self.assertNotIn("chunk_chars", defaults)
 
     def test_explicit_model_override_is_still_compatible(self):
         args = self.args()
-        args.packet_profile = "weibo-ablation"
+        args.packet_profile = "long-review"
         args.model = "custom-compatible-model"
 
         with mock.patch.object(
             self.delegate.sys,
             "argv",
             [
-                "deepseek_delegate.py",
+                "review_helper.py",
                 "--packet-profile",
-                "weibo-ablation",
+                "long-review",
                 "--model",
                 "custom-compatible-model",
             ],
@@ -173,13 +199,13 @@ class DeepSeekDelegateTests(unittest.TestCase):
                 "max_context_chars": 1234,
             },
         }
-        with tempfile.TemporaryDirectory() as tmp:
-            path = pathlib.Path(tmp) / "packet.deepseek.json"
+        with temp_dir() as tmp:
+            path = pathlib.Path(tmp) / "packet.review-helper.json"
             path.write_text(json.dumps(payload), encoding="utf-8")
             with mock.patch.object(
                 self.delegate.sys,
                 "argv",
-                ["deepseek_delegate.py", "--input-json", str(path)],
+                ["review_helper.py", "--input-json", str(path)],
             ):
                 args = self.delegate.parse_args()
 
@@ -198,7 +224,7 @@ class DeepSeekDelegateTests(unittest.TestCase):
         with mock.patch.object(
             self.delegate.sys,
             "argv",
-            ["deepseek_delegate.py", "--input-json", "-"],
+            ["review_helper.py", "--input-json", "-"],
         ):
             with mock.patch.object(self.delegate.sys, "stdin", io.StringIO(json.dumps(payload))):
                 args = self.delegate.parse_args()
@@ -211,16 +237,41 @@ class DeepSeekDelegateTests(unittest.TestCase):
         with mock.patch.object(
             self.delegate.sys,
             "argv",
-            ["deepseek_delegate.py", "--input-json", "-"],
+            ["review_helper.py", "--input-json", "-"],
         ):
             with mock.patch.object(self.delegate.sys, "stdin", io.StringIO("{bad")):
                 with self.assertRaises(self.delegate.DelegateArgumentError):
                     self.delegate.parse_args()
 
+    def test_input_json_rejects_chunk_and_batch_delegation(self):
+        for payload in [
+            {
+                "task": "Review this packet.",
+                "context_text": "x",
+                "options": {"chunk_chars": 1000},
+            },
+            {
+                "task": "Run batch ablation on these model outputs.",
+                "context_text": "x",
+            },
+        ]:
+            with mock.patch.object(
+                self.delegate.sys,
+                "argv",
+                ["review_helper.py", "--input-json", "-"],
+            ):
+                with mock.patch.object(
+                    self.delegate.sys,
+                    "stdin",
+                    io.StringIO(json.dumps(payload)),
+                ):
+                    with self.assertRaises(self.delegate.DelegateArgumentError):
+                        self.delegate.parse_args()
+
         with mock.patch.object(
             self.delegate.sys,
             "argv",
-            ["deepseek_delegate.py", "--input-json", "-"],
+            ["review_helper.py", "--input-json", "-"],
         ):
             with mock.patch.object(self.delegate.sys, "stdin", io.StringIO('{"context_text":"x"}')):
                 with self.assertRaises(self.delegate.DelegateArgumentError):
@@ -230,7 +281,7 @@ class DeepSeekDelegateTests(unittest.TestCase):
         with mock.patch.object(
             self.delegate.sys,
             "argv",
-            ["deepseek_delegate.py", "--input-json", "-", "--json-result"],
+            ["review_helper.py", "--input-json", "-", "--json-result"],
         ):
             with mock.patch.object(self.delegate.sys, "stdin", io.StringIO("{bad")):
                 stdout = io.StringIO()
@@ -265,6 +316,8 @@ class DeepSeekDelegateTests(unittest.TestCase):
         self.assertNotIn(prompt, stdin_invocation)
         self.assertIn("--prompt-file", " ".join(file_invocation))
         self.assertIn("--stdin", " ".join(stdin_invocation))
+        self.assertIn("--telemetry", file_invocation)
+        self.assertIn("false", file_invocation)
 
     def test_resolve_backend_transport_rejects_unadvertised_file_transport(self):
         args = self.args()
@@ -349,8 +402,8 @@ class DeepSeekDelegateTests(unittest.TestCase):
         self.assertTrue(result["structured_result"])
         self.assertEqual(result["timeout_seconds"], 222)
         self.assertEqual(result["max_context_chars"], 333)
-        self.assertEqual(result["chunk_chars"], 44)
-        self.assertEqual(result["max_findings_per_chunk"], 6)
+        self.assertNotIn("chunk_chars", result)
+        self.assertNotIn("max_findings_per_chunk", result)
 
     def test_mcp_envelope_status_controls_exit_code_and_structured_output(self):
         args = self.args()
@@ -388,6 +441,30 @@ class DeepSeekDelegateTests(unittest.TestCase):
 
         self.assertEqual(code, 2)
         self.assertIn("setup_error", output)
+
+    def test_request_envelope_declares_data_boundary(self):
+        envelope = self.delegate.request_envelope(self.args(), None)
+
+        boundary = envelope["data_boundary"]
+        self.assertIn("task", boundary["external_cli_receives"])
+        self.assertIn("Codex hidden prompts", boundary["external_cli_does_not_receive"])
+        self.assertIn("batch", boundary["forbidden_use"])
+        self.assertEqual(envelope["chunk_policy"]["batch_delegation"], "disabled")
+
+    def test_isolated_delegate_cwd_uses_runtime_root_and_cleans_up(self):
+        with temp_dir() as tmp:
+            with mock.patch.dict(
+                self.delegate.os.environ,
+                {"DEEPSEEK_DELEGATE_RUNTIME_DIR": tmp},
+                clear=False,
+            ):
+                run_dir, warning = self.delegate.create_isolated_delegate_cwd()
+                self.assertIsNone(warning)
+                self.assertTrue(pathlib.Path(run_dir).exists())
+                self.assertEqual(pathlib.Path(run_dir).parent, pathlib.Path(tmp))
+                with mock.patch.object(self.delegate.shutil, "rmtree") as rmtree:
+                    self.delegate.cleanup_isolated_delegate_cwd(run_dir)
+                rmtree.assert_called_once()
 
     def test_missing_required_headings_ignores_fenced_code(self):
         output = "\n".join(
@@ -488,18 +565,6 @@ class DeepSeekDelegateTests(unittest.TestCase):
         self.assertFalse(bad["headings_checked"])
         self.assertEqual(self.delegate.final_status(0, [good, bad]), "partial")
 
-    def test_boundary_chunking_keeps_blocks_intact(self):
-        text = "Candidate 1:\nalpha\nCandidate 2:\nbeta\nCandidate 3:\ngamma\n"
-
-        chunks = self.delegate.split_text(
-            text,
-            chunk_chars=32,
-            boundary_regex=r"^\s*Candidate\s+\d+:",
-        )
-
-        self.assertEqual(len(chunks), 3)
-        self.assertTrue(all(chunk.startswith("Candidate") for chunk in chunks))
-
     def test_sensitive_text_rejects_secret_like_context(self):
         with self.assertRaises(self.delegate.DelegateSetupError):
             self.delegate.reject_sensitive_text(
@@ -534,9 +599,12 @@ class DeepSeekDelegateTests(unittest.TestCase):
         )
 
         tools = result["result"]["tools"]
-        self.assertEqual([tool["name"] for tool in tools], ["deepseek_delegate_review"])
+        self.assertEqual([tool["name"] for tool in tools], ["codex_review_helper_review"])
         description = tools[0]["description"].lower()
         self.assertIn("bounded", description)
+        self.assertIn("single explicit packet", description)
+        self.assertIn("training data", description)
+        self.assertIn("batch jobs", description)
         self.assertNotIn("shell", tools[0]["name"])
         self.assertNotIn("command", tools[0]["name"])
 
@@ -550,7 +618,7 @@ class DeepSeekDelegateTests(unittest.TestCase):
                 "id": 2,
                 "method": "tools/call",
                 "params": {
-                    "name": "deepseek_delegate_review",
+                    "name": "codex_review_helper_review",
                     "arguments": {"task": "Review packet.", "context_text": "hello"},
                 },
             },
@@ -592,3 +660,4 @@ class DeepSeekDelegateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

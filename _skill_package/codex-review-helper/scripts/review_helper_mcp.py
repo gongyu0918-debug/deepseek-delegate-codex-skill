@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tiny stdio MCP wrapper for DeepSeek Delegate review packets."""
+"""Tiny stdio MCP wrapper for one-packet Codex review helper packets."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ from typing import Any, Callable
 
 
 JSONRPC = "2.0"
-TOOL_NAME = "deepseek_delegate_review"
-SCRIPT_PATH = pathlib.Path(__file__).with_name("deepseek_delegate.py")
+TOOL_NAME = "codex_review_helper_review"
+SCRIPT_PATH = pathlib.Path(__file__).with_name("review_helper.py")
 
 
 def response(request_id: Any, result: Any = None, error: dict | None = None) -> dict:
@@ -48,8 +48,9 @@ def tool_schema() -> dict:
     return {
         "name": TOOL_NAME,
         "description": (
-            "Run a bounded, read-only DeepSeek Delegate advisory review. "
-            "Use for packet-local second opinions only; not for shell, edits, or full-repo work."
+            "Run one bounded, read-only external CLI advisory review. "
+            "Use only for a single explicit packet second opinion; not for shell, edits, "
+            "full-repo work, batch jobs, training data, evaluation data, or ablation."
         ),
         "inputSchema": {
             "type": "object",
@@ -57,11 +58,11 @@ def tool_schema() -> dict:
                 "task": {"type": "string", "description": "Bounded review task."},
                 "mode": {
                     "type": "string",
-                    "enum": ["answer", "audit", "calibration", "ablation", "review"],
+                    "enum": ["answer", "audit", "review"],
                 },
                 "packet_profile": {
                     "type": "string",
-                    "enum": ["default", "long-review", "weibo-ablation", "weibo-calibration"],
+                    "enum": ["default", "long-review"],
                 },
                 "context_text": {"type": "string", "description": "Inline packet text."},
                 "context_files": {
@@ -72,7 +73,6 @@ def tool_schema() -> dict:
                 "cwd": {"type": "string", "description": "Workspace root for relative files."},
                 "timeout_seconds": {"type": "integer", "minimum": 1},
                 "max_context_chars": {"type": "integer", "minimum": 0},
-                "chunk_chars": {"type": "integer", "minimum": 0},
                 "structured_result": {"type": "boolean"},
             },
             "required": ["task"],
@@ -135,7 +135,7 @@ def build_delegate_payload(arguments: dict) -> tuple[dict, int]:
             "timeout_seconds": timeout_seconds,
         },
     }
-    for field in ("max_context_chars", "chunk_chars"):
+    for field in ("max_context_chars",):
         if field in arguments:
             payload["options"][field] = int(arguments[field])
     return payload, timeout_seconds
@@ -154,7 +154,7 @@ def run_delegate_review(arguments: dict) -> dict:
             "w",
             encoding="utf-8",
             errors="replace",
-            suffix=".deepseek-request.json",
+            suffix=".review-helper-request.json",
             delete=False,
         ) as handle:
             json.dump(payload, handle, ensure_ascii=False)
@@ -215,7 +215,7 @@ def handle_request(
             {
                 "protocolVersion": "2025-03-26",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "deepseek-delegate", "version": "2"},
+                "serverInfo": {"name": "codex-review-helper", "version": "2"},
             },
         )
     if method == "notifications/initialized":

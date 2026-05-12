@@ -1,10 +1,14 @@
 *
 !/.gitignore
+!/README.md
+!/SECURITY.md
+!/LICENSE
 !/_skill_package/
 !/_skill_package/**
 !/tests/
 !/tests/**
+/tests/_tmp*/
+/tests/_runtime_tmp/
 /_skill_package/deepseek-config/
-!/weibo-hotness-skill-maintenance.md
 **/__pycache__/
 *.py[cod]

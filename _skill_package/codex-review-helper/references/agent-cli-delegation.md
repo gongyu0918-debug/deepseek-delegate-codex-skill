@@ -1,6 +1,6 @@
 # Agent CLI Delegation Patterns
 
-Load this file when changing transport behavior or comparing DeepSeek Delegate with Codex, Claude Code, Gemini CLI, OpenClaw, or other agent CLI integrations.
+Load this file when changing transport behavior or comparing Codex Review Helper with Codex, Claude Code, Gemini CLI, OpenClaw, or other agent CLI integrations.
 
 ## Selection Order
 
@@ -20,24 +20,25 @@ Load this file when changing transport behavior or comparing DeepSeek Delegate w
 ## Codex-Side Routing
 
 - Native Codex or Codex subagent: repo work, implementation, full-repo review, architecture, parallel workers, or any task that needs integrated workspace context.
-- DeepSeek Delegate: bounded advisory packets where `deepseek-v4-pro` can provide a second opinion from packet evidence only.
+- Codex Review Helper: one bounded advisory packet where a configured external CLI can provide a second opinion from packet evidence only.
 - MCP tool: use only when a real delegate/review tool is exposed through `tools/list`.
 - CLI JSON adapter: preferred default for this skill because it avoids extra MCP tool-schema overhead while still keeping large packets out of shell argv.
-- CLI exec adapter: backend fallback when MCP has no delegate/review tool and DeepSeek TUI has no prompt-file/stdin support.
+- CLI exec adapter: backend fallback when MCP has no delegate/review tool and the configured CLI has no prompt-file/stdin support.
 
-## DeepSeek Delegate Boundary
+## Helper Boundary
 
 - Codex is the supervisor and owns final judgment, file writes, validators, and user-facing synthesis.
-- DeepSeek receives only one task-local packet and returns advisory findings.
-- Current local status: `deepseek mcp-server` starts, but `tools/list` exposes no delegate/review tool, so `--driver auto` falls back to `exec`.
+- The external CLI receives only one task-local packet and returns advisory findings.
+- The external CLI must not receive batches, A/B ablation packets, training/evaluation datasets, repeated social workflow samples, or collected Codex/GPT outputs.
+- Current local status: the configured CLI MCP server may start, but `tools/list` must expose a real delegate/review tool before `--driver mcp` is allowed; otherwise `--driver auto` falls back to `exec`.
 - `--driver mcp` must fail closed if no delegate/review tool is exposed.
 - `--input-json` should be the normal automation entry for larger packets.
-- Optional local MCP wrapper use must stay one-tool and narrow; do not install a broad DeepSeek command bridge for this skill.
+- Optional local MCP wrapper use must stay one-tool and narrow; do not install a broad command bridge for this skill.
 - `--driver exec` must stay read-only, non-interactive, timeout-bound, and observable through JSON result metadata.
 
 ## Anti-Patterns
 
 - Do not expose shell, terminal, process, or command MCP tools as delegate tools.
 - Do not pass full conversation history, repo-wide context, credentials, cookies, or unrelated user data.
-- Do not let DeepSeek decide acceptance. Local checks and Codex synthesis remain authoritative.
-- Do not use batch size as a reason to delegate unless chunks are independent and evidence-preserving.
+- Do not let the external CLI decide acceptance. Local checks and Codex synthesis remain authoritative.
+- Do not use batch size as a reason to delegate. Shrink the packet or keep the work in Codex.

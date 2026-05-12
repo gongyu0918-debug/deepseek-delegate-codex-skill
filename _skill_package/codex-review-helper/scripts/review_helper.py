@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Delegate a small bounded task to DeepSeek TUI with deterministic framing."""
+"""Delegate one small bounded packet to a configured external review CLI."""
 
 from __future__ import annotations
 
@@ -124,7 +124,7 @@ class DelegateArgumentError(DelegateSetupError):
 
 
 class DelegateExecutableError(DelegateSetupError):
-    """DeepSeek executable or transport setup failed."""
+    """External CLI executable or transport setup failed."""
 
     exit_code = 127
 
@@ -161,11 +161,15 @@ SENSITIVE_PATTERNS = [
     re.compile(r'"cookies"\s*:\s*{', re.IGNORECASE),
 ]
 
+FORBIDDEN_DELEGATION_TASK_PATTERNS = [
+    re.compile(r"\b(batch|batches|bulk|corpus|dataset|datasets|training|train|distill|distillation)\b", re.IGNORECASE),
+    re.compile(r"\b(ablation|calibration|benchmark|scoring|labeling|eval|evaluation)\b", re.IGNORECASE),
+    re.compile(r"(批量|语料|数据集|训练|蒸馏|消融|校准|标注|评分|评测|模型评估)"),
+]
+
 MODE_GUIDANCE = {
     "answer": "Answer the bounded task concisely from the supplied packet only.",
     "audit": "Audit the supplied packet for risks, gaps, contradictions, or missed checks.",
-    "calibration": "Compare supplied samples against the stated quality target; extract repeatable calibration signals.",
-    "ablation": "Evaluate before/after or candidate variants; identify which changes improve or regress the target metric.",
     "review": "Review the supplied packet like a code reviewer; report only concrete, evidence-backed findings.",
 }
 
@@ -174,31 +178,9 @@ PROFILE_DEFAULTS = {
     "default": {},
     "long-review": {
         "model": "deepseek-v4-pro",
-        "max_context_chars": 100000,
+        "max_context_chars": 24000,
         "prompt_char_limit": 24000,
-        "chunk_chars": 18000,
         "timeout_seconds": 360,
-        "max_findings_per_chunk": 8,
-    },
-    "weibo-ablation": {
-        "mode": "ablation",
-        "model": "deepseek-v4-pro",
-        "max_context_chars": 220000,
-        "prompt_char_limit": 24000,
-        "chunk_boundary_regex": r"^\s*(?:[-*]\s+|#{1,6}\s+)?Candidate\s+\d+:",
-        "chunk_chars": 15000,
-        "timeout_seconds": 300,
-        "max_findings_per_chunk": 10,
-    },
-    "weibo-calibration": {
-        "mode": "calibration",
-        "model": "deepseek-v4-pro",
-        "max_context_chars": 180000,
-        "prompt_char_limit": 24000,
-        "chunk_boundary_regex": r"^\s*(?:[-*]\s+|#{1,6}\s+)?Candidate\s+\d+:",
-        "chunk_chars": 15000,
-        "timeout_seconds": 300,
-        "max_findings_per_chunk": 12,
     },
 }
 
@@ -211,26 +193,22 @@ CHOICE_FIELDS = {
 }
 
 
-WEIBO_CONTRACT = """Weibo-specific rules:
-- Treat candidate ids, original_url, source_tail, title/topic shells, and immutable_blocks as evidence anchors.
-- Do not smooth over missing source binding, source_tail drift, original URL mismatch, or changed immutable blocks.
-- Prefer distinct factual increments; flag duplicate same-angle chains instead of filling quota.
-- Judge against concise formal Weibo hot-news brief style, not marketing/commentary tone.
-- Return repeatable calibration signals Codex can verify with local validators and ablation gates.
-- Use deepseek-v4-pro for Weibo ablation and calibration packets.
-"""
+BATCH_DISABLED_MESSAGE = (
+    "batch/chunk delegation is disabled by the privacy boundary; "
+    "send one smaller explicit packet or keep the work in Codex"
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = DelegateArgumentParser(
-        description="Call deepseek exec with a compact delegation packet."
+        description="Call the configured review CLI with a compact delegation packet."
     )
     parser.add_argument(
         "--input-json",
         default=None,
         help="Read delegate request JSON from this file, or '-' for stdin.",
     )
-    parser.add_argument("--task", default=None, help="Bounded task for DeepSeek.")
+    parser.add_argument("--task", default=None, help="Bounded review task.")
     parser.add_argument(
         "--packet-profile",
         choices=sorted(PROFILE_DEFAULTS),
@@ -254,7 +232,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=argparse.SUPPRESS,
     )
-    parser.add_argument("--cwd", default=None, help="Working directory for deepseek exec.")
+    parser.add_argument("--cwd", default=None, help="Base directory for resolving explicit context files.")
     parser.add_argument(
         "--driver",
         choices=DRIVER_CHOICES,
@@ -264,12 +242,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--provider",
         default="deepseek",
-        help="Provider to pass to deepseek before exec.",
+        help="Provider to pass to the configured CLI before exec.",
     )
     parser.add_argument(
         "--model",
         default="deepseek-v4-pro",
-        help="Model to pass to deepseek before exec.",
+        help="Model to pass to the configured CLI before exec.",
     )
     parser.add_argument(
         "--sandbox-mode",
@@ -286,8 +264,8 @@ def parse_args() -> argparse.Namespace:
         choices=BACKEND_TRANSPORT_CHOICES,
         default="auto",
         help=(
-            "DeepSeek exec prompt transport. auto currently resolves to exec-argv; "
-            "exec-file/stdin are reserved until deepseek exec exposes prompt-file or stdin support."
+            "Prompt transport. auto currently resolves to exec-argv; "
+            "exec-file/stdin are reserved until the configured CLI exposes prompt-file or stdin support."
         ),
     )
     parser.add_argument(
@@ -300,7 +278,7 @@ def parse_args() -> argparse.Namespace:
         "--timeout-seconds",
         type=int,
         default=180,
-        help="Timeout for each deepseek exec call.",
+        help="Timeout for each external CLI call.",
     )
     parser.add_argument(
         "--mcp-probe-timeout-seconds",
@@ -318,20 +296,20 @@ def parse_args() -> argparse.Namespace:
         "--chunk-chars",
         type=int,
         default=0,
-        help="Split long context into chunks of this size and call DeepSeek once per chunk.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--chunk-boundary-regex",
         default=None,
-        help="Optional line regex that starts a new evidence block before chunk packing.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--max-findings-per-chunk",
         type=int,
         default=5,
-        help="Guidance for chunked audits/reviews to keep each response concise.",
+        help=argparse.SUPPRESS,
     )
-    parser.add_argument("--out", default=None, help="Optional file for raw DeepSeek output.")
+    parser.add_argument("--out", default=None, help="Optional file for raw helper output.")
     parser.add_argument(
         "--json-result",
         action="store_true",
@@ -340,7 +318,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--structured-result",
         action="store_true",
-        help="Ask DeepSeek for a strict JSON findings object and validate it in the result envelope.",
+        help="Ask the helper for a strict JSON findings object and validate it in the result envelope.",
     )
     args = parser.parse_args()
     args._input_json_fields = set()
@@ -353,6 +331,7 @@ def parse_args() -> argparse.Namespace:
         argument_error(args, "--task is required unless supplied by --input-json")
     apply_profile_defaults(args)
     validate_provider_model(args, parser)
+    validate_privacy_boundary_args(args)
     return args
 
 
@@ -510,6 +489,7 @@ def fallback_args_for_setup_error(partial: argparse.Namespace | None = None) -> 
         _resolved_backend_transport=None,
         _single_packet_attempted=False,
         _chunk_reason=None,
+        _delegate_cwd=None,
     )
 
 
@@ -534,6 +514,21 @@ def validate_provider_model(args: argparse.Namespace, parser: argparse.ArgumentP
             "non-deepseek provider requires an explicit compatible --model; "
             f"got provider={args.provider!r} model={args.model!r}"
         )
+
+
+def validate_privacy_boundary_args(args: argparse.Namespace) -> None:
+    if args.chunk_chars:
+        argument_error(args, BATCH_DISABLED_MESSAGE)
+    if args.chunk_boundary_regex:
+        argument_error(args, BATCH_DISABLED_MESSAGE)
+    task = args.task or ""
+    for pattern in FORBIDDEN_DELEGATION_TASK_PATTERNS:
+        if pattern.search(task):
+            argument_error(
+                args,
+                "task appears to request batch, corpus, ablation, calibration, training, "
+                "or model-evaluation delegation; this helper only accepts one-off review packets"
+            )
 
 
 def read_context_files(
@@ -632,21 +627,12 @@ def reject_sensitive_text(text: str, source: str) -> None:
         if pattern.search(text):
             raise DelegateSetupError(
                 "sensitive-looking content detected in "
-                f"{source}; refusing to pass it to DeepSeek Delegate"
+                f"{source}; refusing to pass it to the review helper"
             )
 
 
 def build_prompt(args: argparse.Namespace, context: str) -> str:
     headings = "\n".join(f"## {heading}" for heading in REQUIRED_HEADINGS)
-    chunk_guidance = ""
-    if args.chunk_chars > 0:
-        chunk_guidance = (
-            f"- For chunked long text, report at most {args.max_findings_per_chunk} "
-            "highest-value findings for this chunk.\n"
-        )
-    profile_guidance = ""
-    if args.packet_profile.startswith("weibo-") or args.mode in {"ablation", "calibration"}:
-        profile_guidance = WEIBO_CONTRACT
     result_contract = (
         STRUCTURED_RESULT_SCHEMA.rstrip()
         if args.structured_result
@@ -662,14 +648,15 @@ Mode guidance: {MODE_GUIDANCE[args.mode]}
 Rules:
 - Use only the task and context packet below.
 - Do not modify files.
+- This is a one-off review packet, not training data, evaluation data, a benchmark, a corpus, or a batch job.
+- Do not ask for additional packets and do not produce scoring, labels, or reusable calibration rules.
 - Do not assume hidden Codex conversation context.
+- You cannot see Codex/GPT hidden prompts, memory, repo files not shown, environment variables, credentials, cookies, browser/session data, or conversation history.
 - Be concise and evidence-bound.
-- Treat your findings as hypotheses until Codex reproduces or verifies them locally.
-- For review findings, cite concrete packet evidence, a minimal reproduction, or a static code path.
+- Return only review findings, code-check findings, or bug-risk findings with concrete packet evidence.
+- Codex will only accept or reject findings inside the Codex thread; your output will not be sent back for iterative correction.
 - If evidence is insufficient, say so in Uncertainty.
 - Keep the response compact enough to finish completely.
-{chunk_guidance.rstrip()}
-{profile_guidance.rstrip()}
 {result_contract}
 
 Task:
@@ -678,76 +665,6 @@ Task:
 Context packet:
 {context}
 """
-
-
-def split_text(text: str, chunk_chars: int, boundary_regex: str | None = None) -> list[str]:
-    if chunk_chars <= 0 or len(text) <= chunk_chars:
-        return [text]
-    if boundary_regex:
-        boundary_chunks = split_text_by_boundary(text, chunk_chars, boundary_regex)
-        if boundary_chunks:
-            return boundary_chunks
-
-    chunks: list[str] = []
-    start = 0
-    while start < len(text):
-        end = min(start + chunk_chars, len(text))
-        if end < len(text):
-            newline = text.rfind("\n", start, end)
-            if newline > start + max(200, chunk_chars // 2):
-                end = newline + 1
-        chunks.append(text[start:end])
-        start = end
-    return chunks
-
-
-def split_text_by_boundary(text: str, chunk_chars: int, boundary_regex: str) -> list[str]:
-    pattern = re.compile(boundary_regex)
-    saw_boundary = False
-    blocks: list[str] = []
-    current: list[str] = []
-
-    for line in text.splitlines(keepends=True):
-        if pattern.search(line) and current:
-            saw_boundary = True
-            blocks.append("".join(current))
-            current = [line]
-        else:
-            if pattern.search(line):
-                saw_boundary = True
-            current.append(line)
-    if current:
-        blocks.append("".join(current))
-    if len(blocks) <= 1:
-        if not blocks:
-            return []
-        if saw_boundary and len(blocks[0]) > chunk_chars:
-            raise DelegateSetupError(
-                "single boundary block exceeds --chunk-chars; trim the block or raise "
-                f"--chunk-chars without exceeding --prompt-char-limit (block chars={len(blocks[0])}, "
-                f"limit={chunk_chars})"
-            )
-        if saw_boundary:
-            return blocks
-        return []
-
-    chunks: list[str] = []
-    current_chunk = ""
-    for block in blocks:
-        if len(block) > chunk_chars:
-            raise DelegateSetupError(
-                "single boundary block exceeds --chunk-chars; trim the block or raise "
-                f"--chunk-chars without exceeding --prompt-char-limit (block chars={len(block)}, "
-                f"limit={chunk_chars})"
-            )
-        if current_chunk and len(current_chunk) + len(block) > chunk_chars:
-            chunks.append(current_chunk)
-            current_chunk = block
-        else:
-            current_chunk += block
-    if current_chunk:
-        chunks.append(current_chunk)
-    return chunks
 
 
 def deepseek_executable() -> str | None:
@@ -799,6 +716,8 @@ def deepseek_invocation(
     prompt_path: pathlib.Path | None = None,
 ) -> list[str]:
     common_args = [
+        "--telemetry",
+        "false",
         "--provider",
         args.provider,
         "--model",
@@ -864,7 +783,7 @@ def resolve_backend_transport(args: argparse.Namespace, driver: str) -> str:
         if deepseek_exec_supports_transport(requested):
             return requested
         raise DelegateSetupError(
-            f"backend transport {requested} is reserved, but this deepseek exec "
+            f"backend transport {requested} is reserved, but the configured CLI "
             "does not advertise prompt-file/stdin support"
         )
     raise DelegateSetupError(f"unknown backend transport: {requested}")
@@ -878,6 +797,48 @@ def backend_allows_single_packet(args: argparse.Namespace, prompt: str, backend_
     if not backend_prompt_has_command_limit(backend_transport):
         return True
     return len(prompt) <= args.prompt_char_limit
+
+
+def create_isolated_delegate_cwd() -> tuple[str, str | None]:
+    """Create an empty cwd for the downstream CLI so it cannot start inside the repo."""
+    requested_root = os.environ.get("DEEPSEEK_DELEGATE_RUNTIME_DIR")
+    roots: list[pathlib.Path] = []
+    if requested_root:
+        roots.append(pathlib.Path(requested_root).expanduser())
+    roots.append(pathlib.Path(tempfile.gettempdir()) / "codex-review-helper")
+    roots.append(pathlib.Path.cwd() / ".codex-review-helper-runtime")
+
+    last_error: Exception | None = None
+    for root in roots:
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            run_dir = root / f"run-{os.getpid()}-{time.monotonic_ns()}"
+            run_dir.mkdir(exist_ok=False)
+            return str(run_dir), None
+        except OSError as exc:
+            last_error = exc
+            continue
+    raise DelegateSetupError(f"cannot create isolated delegate cwd: {last_error}")
+
+
+def cleanup_isolated_delegate_cwd(path: str | None) -> None:
+    if not path:
+        return
+    run_dir = pathlib.Path(path).resolve()
+    for root in [
+        os.environ.get("DEEPSEEK_DELEGATE_RUNTIME_DIR"),
+        str(pathlib.Path(tempfile.gettempdir()) / "codex-review-helper"),
+        str(pathlib.Path.cwd() / ".codex-review-helper-runtime"),
+    ]:
+        if not root:
+            continue
+        root_path = pathlib.Path(root).expanduser().resolve()
+        try:
+            run_dir.relative_to(root_path)
+        except ValueError:
+            continue
+        shutil.rmtree(run_dir, ignore_errors=True)
+        return
 
 
 def mcp_send(proc: subprocess.Popen[str], payload: dict) -> None:
@@ -969,7 +930,7 @@ def list_mcp_tools(cwd: str | None = None, timeout_seconds: int = 8) -> list[dic
             {
                 "protocolVersion": MCP_PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": {"name": "codex-deepseek-delegate", "version": "1"},
+                "clientInfo": {"name": "codex-review-helper", "version": "1"},
             },
             timeout_seconds=timeout_seconds,
         )
@@ -1065,12 +1026,6 @@ def mcp_tool_arguments(tool: dict, args: argparse.Namespace, prompt: str, cwd: s
         arguments["timeout_seconds"] = args.timeout_seconds
     if accepts("max_context_chars"):
         arguments["max_context_chars"] = args.max_context_chars
-    if accepts("chunk_chars"):
-        arguments["chunk_chars"] = args.chunk_chars
-    if accepts("chunk_boundary_regex"):
-        arguments["chunk_boundary_regex"] = args.chunk_boundary_regex
-    if accepts("max_findings_per_chunk"):
-        arguments["max_findings_per_chunk"] = args.max_findings_per_chunk
     return arguments
 
 
@@ -1148,7 +1103,7 @@ def call_deepseek_mcp_driver(
             {
                 "protocolVersion": MCP_PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": {"name": "codex-deepseek-delegate", "version": "1"},
+                "clientInfo": {"name": "codex-review-helper", "version": "1"},
             },
         )
         result = mcp_request(
@@ -1310,7 +1265,7 @@ def validate_delegate_prompt(
     if backend_prompt_has_command_limit(backend_transport) and len(prompt) > args.prompt_char_limit:
         raise DelegateSetupError(
             f"prompt chars={len(prompt)} exceeds --prompt-char-limit={args.prompt_char_limit}; "
-            "lower --chunk-chars or reduce --max-context-chars"
+            "reduce the packet or keep the review in Codex"
         )
     reject_sensitive_text(prompt, "delegation prompt")
 
@@ -1330,7 +1285,7 @@ def call_deepseek_exec_driver(
                 "w",
                 encoding="utf-8",
                 errors="replace",
-                suffix=".deepseek-prompt.txt",
+                suffix=".review-helper-prompt.txt",
                 delete=False,
             ) as handle:
                 handle.write(prompt)
@@ -1347,7 +1302,7 @@ def call_deepseek_exec_driver(
         if os.name == "nt" and len(subprocess.list2cmdline(invocation)) > windows_command_limit(invocation):
             raise DelegateSetupError(
                 "estimated Windows command line exceeds conservative Windows limit; "
-                "lower --chunk-chars, shorten --task, or reduce --max-context-chars"
+                "shorten --task, reduce --max-context-chars, or keep the review in Codex"
             )
         result = subprocess.run(
             invocation,
@@ -1439,6 +1394,7 @@ def request_envelope(args: argparse.Namespace, cwd: str | None) -> dict:
         "provider": args.provider,
         "model": args.model,
         "cwd": cwd,
+        "delegate_cwd_isolated": bool(getattr(args, "_delegate_cwd", None)),
         "context_files": list(args.context_file),
         "driver": args.driver,
         "backend_transport_request": getattr(args, "backend_transport", "auto"),
@@ -1454,12 +1410,34 @@ def request_envelope(args: argparse.Namespace, cwd: str | None) -> dict:
             "prompt_char_limit": args.prompt_char_limit,
             "max_findings_per_chunk": args.max_findings_per_chunk,
             "structured_result": args.structured_result,
+            "batch_delegation": "disabled",
         },
         "safety_policy": {
             "sandbox_mode": args.sandbox_mode,
             "approval_policy": args.approval_policy,
             "sensitive_guard": "fail-closed before invocation",
             "required_headings": REQUIRED_HEADINGS,
+        },
+        "data_boundary": {
+            "external_cli_receives": [
+                "task",
+                "context_text when provided",
+                "contents of explicitly listed context_files",
+                "helper framing",
+            ],
+            "external_cli_does_not_receive": [
+                "Codex hidden prompts",
+                "GPT conversation history",
+                "memory",
+                "repo files not explicitly attached",
+                "environment variables",
+                "credentials",
+                "cookies",
+                "browser or session data",
+                "training or evaluation datasets",
+            ],
+            "allowed_use": "one-off advisory code review, recheck, and bug-risk findings",
+            "forbidden_use": "batch, ablation, calibration, scoring, corpus labeling, model training, or data collection",
         },
     }
 
@@ -1584,7 +1562,7 @@ def main() -> int:
         args = parse_args()
     except DelegateArgumentError as exc:
         args = fallback_args_for_setup_error(getattr(exc, "args_namespace", None))
-        output = f"DeepSeek delegation setup failed: {exc}\n"
+        output = f"Review helper setup failed: {exc}\n"
         envelope = make_result_envelope(
             args,
             None,
@@ -1603,10 +1581,15 @@ def main() -> int:
         return int(getattr(exc, "exit_code", 2))
     cwd = None
     cwd_valid = False
+    delegate_cwd: str | None = None
     selected_driver: str | None = None
     mcp_tool: dict | None = None
     chunks_meta: list[dict] = []
     warnings: list[str] = []
+
+    def finish(code: int) -> int:
+        cleanup_isolated_delegate_cwd(delegate_cwd)
+        return code
 
     try:
         if args.cwd:
@@ -1624,7 +1607,9 @@ def main() -> int:
         reject_sensitive_text(args.task, "task")
         context = assemble_context(args, base_dir)
         reject_sensitive_text(context, "assembled context packet")
-        selected_driver, driver_warnings, mcp_tool = resolve_driver(args, cwd)
+        delegate_cwd, _delegate_cwd_warning = create_isolated_delegate_cwd()
+        args._delegate_cwd = delegate_cwd
+        selected_driver, driver_warnings, mcp_tool = resolve_driver(args, delegate_cwd)
         warnings.extend(driver_warnings)
         backend_transport = resolve_backend_transport(args, selected_driver)
         args._resolved_backend_transport = backend_transport
@@ -1635,102 +1620,14 @@ def main() -> int:
                 f"full prompt chars={len(prompt)} exceeds prompt_char_limit="
                 f"{args.prompt_char_limit} for backend_transport={backend_transport}"
             )
-            if args.chunk_chars <= 0:
-                raise DelegateSetupError(
-                    args._chunk_reason + "; enable --chunk-chars or reduce the packet"
-                )
-            chunks = split_text(context, args.chunk_chars, args.chunk_boundary_regex)
-            outputs: list[str] = []
-            worst_code = 0
-            for index, chunk in enumerate(chunks, start=1):
-                chunk_id = f"chunk-{index:03d}-of-{len(chunks):03d}"
-                chunk_context = (
-                    f"Chunk ID: {chunk_id}.\n"
-                    f"Chunk {index} of {len(chunks)}. Focus only on this chunk; "
-                    "do not claim full-document completeness or global repository coverage.\n\n"
-                    f"{chunk}"
-                )
-                prompt = build_prompt(args, chunk_context)
-                call = call_deepseek_with_metadata(
-                    args,
-                    prompt,
-                    cwd,
-                    args.timeout_seconds,
-                    selected_driver,
-                    backend_transport,
-                    mcp_tool,
-                )
-                code = int(call["exit_code"])
-                chunk_output = str(call["output"])
-                worst_code = code if code != 0 else worst_code
-                chunk_warnings = list(call["warnings"])
-                structured_result = None
-                structured_errors: list[str] = []
-                if args.structured_result:
-                    missing = []
-                    structured_result, structured_errors = parse_structured_result(chunk_output)
-                    if structured_errors:
-                        worst_code = worst_code or 3
-                        chunk_warnings.append(
-                            "structured result errors: " + "; ".join(structured_errors)
-                        )
-                        chunk_output = (
-                            chunk_output.rstrip()
-                            + "\n\n[delegate warning]\n"
-                            + "Structured result errors: "
-                            + "; ".join(structured_errors)
-                            + ". Treat this chunk as partial; retry with a smaller packet "
-                            + "or clarify the JSON contract.\n"
-                        )
-                else:
-                    missing = missing_required_headings(chunk_output)
-                if missing:
-                    worst_code = worst_code or 3
-                    chunk_warnings.append(
-                        "missing required headings: " + ", ".join(missing)
-                    )
-                    chunk_output = (
-                        chunk_output.rstrip()
-                        + "\n\n[delegate warning]\n"
-                        + "Missing required headings: "
-                        + ", ".join(missing)
-                        + ". Treat this chunk as partial; retry with smaller --chunk-chars "
-                        + "or lower --max-findings-per-chunk if needed.\n"
-                    )
-                chunks_meta.append(
-                    chunk_result(
-                        chunk_id,
-                        call,
-                        missing,
-                        chunk_warnings,
-                        structured_result,
-                        structured_errors,
-                        not args.structured_result,
-                    )
-                )
-                outputs.append(f"# DeepSeek {chunk_id}\n\n{chunk_output}")
-            output = "\n\n---\n\n".join(outputs)
-            write_output(args.out, output, cwd)
-            envelope = make_result_envelope(
-                args,
-                cwd,
-                cwd_valid,
-                final_status(worst_code, chunks_meta),
-                selected_driver,
-                worst_code,
-                chunks_meta,
-                warnings,
-                started_at,
-            )
-            emit_result(args, output, envelope)
-            return worst_code
+            raise DelegateSetupError(args._chunk_reason + "; " + BATCH_DISABLED_MESSAGE)
 
         args._single_packet_attempted = True
         args._chunk_reason = None
         call = call_deepseek_with_metadata(
             args,
             prompt,
-            cwd,
+            delegate_cwd,
             args.timeout_seconds,
             selected_driver,
             backend_transport,
@@ -1780,7 +1677,7 @@ def main() -> int:
             )
         )
     except subprocess.TimeoutExpired as exc:
-        output = f"DeepSeek delegation timed out after {args.timeout_seconds} seconds.\n"
+        output = f"Review helper timed out after {args.timeout_seconds} seconds.\n"
         if exc.stdout:
             output += f"\nPartial stdout:\n{exc.stdout}"
         if exc.stderr:
@@ -1801,9 +1698,9 @@ def main() -> int:
             emit_result(args, output, envelope)
         else:
             print(output, file=sys.stderr)
-        return 124
+        return finish(124)
     except DelegateTimeoutError as exc:
-        output = f"DeepSeek delegation timed out after {args.timeout_seconds} seconds.\n"
+        output = f"Review helper timed out after {args.timeout_seconds} seconds.\n"
         write_error_output(args, output, cwd, cwd_valid)
         envelope = make_result_envelope(
             args,
@@ -1820,9 +1717,9 @@ def main() -> int:
             emit_result(args, output, envelope)
         else:
             print(output, file=sys.stderr)
-        return 124
+        return finish(124)
     except DelegateExecutableError as exc:
-        output = f"DeepSeek delegation setup failed: {exc}\n"
+        output = f"Review helper setup failed: {exc}\n"
         write_error_output(args, output, cwd, cwd_valid)
         envelope = make_result_envelope(
             args,
@@ -1839,9 +1736,9 @@ def main() -> int:
             emit_result(args, output, envelope)
         else:
             print(output, file=sys.stderr)
-        return 127
+        return finish(127)
     except DelegateSetupError as exc:
-        output = f"DeepSeek delegation setup failed: {exc}\n"
+        output = f"Review helper setup failed: {exc}\n"
         write_error_output(args, output, cwd, cwd_valid)
         envelope = make_result_envelope(
             args,
@@ -1858,9 +1755,9 @@ def main() -> int:
             emit_result(args, output, envelope)
         else:
             print(output, file=sys.stderr)
-        return int(getattr(exc, "exit_code", 2))
+        return finish(int(getattr(exc, "exit_code", 2)))
     except Exception as exc:
-        output = f"DeepSeek delegation failed before invocation: {exc}\n"
+        output = f"Review helper failed before invocation: {exc}\n"
         write_error_output(args, output, cwd, cwd_valid)
         envelope = make_result_envelope(
             args,
@@ -1877,7 +1774,7 @@ def main() -> int:
             emit_result(args, output, envelope)
         else:
             print(output, file=sys.stderr)
-        return 1
+        return finish(1)
 
     write_output(args.out, output, cwd if "cwd" in locals() else None)
     envelope = make_result_envelope(
@@ -1893,7 +1790,7 @@ def main() -> int:
     )
     emit_result(args, output, envelope)
 
-    return returncode
+    return finish(returncode)
 
 
 if __name__ == "__main__":

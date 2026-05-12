@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Review Helper"
+  short_description: "Single-packet read-only code review helper through a configured external CLI"
+  default_prompt: "Use $codex-review-helper only for one explicit, non-secret review packet. It is for second-pass code review, code recheck, and bug-risk findings only. Do not use it for batches, A/B ablation, model evaluation, prompt/data collection, implementation, full-repo work, or any workflow that sends Codex/GPT output as a corpus. Codex accepts or rejects findings locally and never loops helper output back for correction."

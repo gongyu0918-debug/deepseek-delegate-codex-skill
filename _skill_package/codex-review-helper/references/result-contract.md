@@ -4,7 +4,7 @@ Load this file when changing `--structured-result`, interpreting `--json-result`
 
 ## Delegate Output
 
-With `--structured-result`, DeepSeek should return one fenced JSON object:
+With `--structured-result`, the external CLI should return one fenced JSON object:
 
 ```json
 {
@@ -26,7 +26,7 @@ With `--structured-result`, DeepSeek should return one fenced JSON object:
 
 ## Helper Semantics
 
-- `status=ok`: delegate exited zero and every chunk satisfied the active result contract.
+- `status=ok`: delegate exited zero and the single result satisfied the active result contract.
 - `status=partial`: delegate returned output, but JSON parsing, required fields, or legacy headings failed.
 - `status=timeout`: the delegate transport exceeded its timeout.
 - `status=setup_error`: local setup, safety guard, MCP probe, cwd, prompt size, or command-line validation failed before a trustworthy result.
@@ -39,9 +39,11 @@ The result envelope also reports transport metadata:
 
 - `input_transport`: `cli`, `json-file`, or `json-stdin`.
 - `backend_transport`: `exec-argv`, `exec-file`, `exec-stdin`, or `mcp-stdio`.
-- `single_packet_attempted`: whether the helper attempted one full packet instead of map/reduce chunks.
-- `chunk_reason`: why the packet was split, usually an `exec-argv` prompt-size guard.
+- `single_packet_attempted`: whether the helper attempted one full packet.
+- `chunk_reason`: why a packet was rejected as too large for the active transport.
 
 ## Codex Acceptance
 
 Codex may use a finding only after it verifies the cited packet evidence or reproduces the suggested check locally. Treat uncited claims, broad advice, style-only rewrites, or findings that depend on missing context as advisory noise.
+
+Do not send helper results back to the external CLI for grading, correction, prompt tuning, or calibration. Codex accepts or rejects findings inside the Codex thread.

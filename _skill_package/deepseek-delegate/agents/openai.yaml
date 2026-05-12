@@ -1,4 +1,0 @@
-interface:
-  display_name: "DeepSeek Delegate"
-  short_description: "Pro-only packet-local advisory review through DeepSeek TUI CLI/JSON"
-  default_prompt: "Use $deepseek-delegate only for a bounded packet, prefer --input-json with --structured-result and --json-result, keep deepseek-v4-pro as the delegate model, inspect transport/chunk metadata, and verify findings locally."
