@@ -304,13 +304,13 @@ class CodexReviewHelperTests(unittest.TestCase):
         args = self.args()
         prompt = "FULL PROMPT SHOULD NOT BE IN ARGV"
 
-        file_invocation = self.delegate.deepseek_invocation(
+        file_invocation = self.delegate.review_cli_exec_invocation(
             args,
             prompt,
             "exec-file",
             pathlib.Path("packet.prompt.txt"),
         )
-        stdin_invocation = self.delegate.deepseek_invocation(args, prompt, "exec-stdin")
+        stdin_invocation = self.delegate.review_cli_exec_invocation(args, prompt, "exec-stdin")
 
         self.assertNotIn(prompt, file_invocation)
         self.assertNotIn(prompt, stdin_invocation)
@@ -323,24 +323,24 @@ class CodexReviewHelperTests(unittest.TestCase):
         args = self.args()
         args.backend_transport = "exec-file"
 
-        with mock.patch.object(self.delegate, "deepseek_exec_supports_transport", return_value=False):
+        with mock.patch.object(self.delegate, "review_cli_exec_supports_transport", return_value=False):
             with self.assertRaisesRegex(self.delegate.DelegateSetupError, "reserved"):
                 self.delegate.resolve_backend_transport(args, "exec")
 
-    def test_deepseek_mcp_invocation_reuses_windows_shim_wrapper(self):
-        with mock.patch.object(self.delegate, "deepseek_executable", return_value="C:/bin/deepseek.ps1"):
+    def test_review_cli_mcp_invocation_reuses_windows_shim_wrapper(self):
+        with mock.patch.object(self.delegate, "review_cli_executable", return_value="C:/bin/review-cli.ps1"):
             with mock.patch.object(self.delegate.os, "name", "nt"):
-                invocation = self.delegate.deepseek_mcp_invocation()
+                invocation = self.delegate.review_cli_mcp_invocation()
 
         self.assertEqual(invocation[:5], ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
         self.assertEqual(invocation[-1], "mcp-server")
 
     def test_transport_probe_reuses_windows_shim_wrapper(self):
-        completed = mock.Mock(stdout="Usage: deepseek exec --prompt-file", stderr="")
-        with mock.patch.object(self.delegate, "deepseek_executable", return_value="C:/bin/deepseek.ps1"):
+        completed = mock.Mock(stdout="Usage: review-cli exec --prompt-file", stderr="")
+        with mock.patch.object(self.delegate, "review_cli_executable", return_value="C:/bin/review-cli.ps1"):
             with mock.patch.object(self.delegate.os, "name", "nt"):
                 with mock.patch.object(self.delegate.subprocess, "run", return_value=completed) as run:
-                    self.assertTrue(self.delegate.deepseek_exec_supports_transport("exec-file"))
+                    self.assertTrue(self.delegate.review_cli_exec_supports_transport("exec-file"))
 
         invocation = run.call_args.args[0]
         self.assertEqual(invocation[:5], ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
@@ -350,7 +350,7 @@ class CodexReviewHelperTests(unittest.TestCase):
         tool = {"inputSchema": {"properties": {"prompt": {}, "task": {}}}}
 
         result = self.delegate.mcp_tool_arguments(
-            tool, self.args(), "FULL PROMPT", "F:/Workspaces/deepseek-tui"
+            tool, self.args(), "FULL PROMPT", "F:/Workspaces/project"
         )
 
         self.assertEqual(result["prompt"], "FULL PROMPT")
@@ -455,7 +455,7 @@ class CodexReviewHelperTests(unittest.TestCase):
         with temp_dir() as tmp:
             with mock.patch.dict(
                 self.delegate.os.environ,
-                {"DEEPSEEK_DELEGATE_RUNTIME_DIR": tmp},
+                {"CODEX_REVIEW_HELPER_RUNTIME_DIR": tmp},
                 clear=False,
             ):
                 run_dir, warning = self.delegate.create_isolated_delegate_cwd()
@@ -660,4 +660,5 @@ class CodexReviewHelperTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 

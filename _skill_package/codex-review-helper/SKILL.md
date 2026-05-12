@@ -5,12 +5,12 @@ description: "Single-packet read-only review helper for Codex. Use only for one 
 
 # Codex Review Helper
 
-Delegate one explicit packet to the user's configured local review CLI for advisory review while Codex keeps final judgment, file edits, and local verification. The current adapter calls the local `deepseek` executable with `deepseek-v4-pro`; that dependency stays inside the transport layer, not the trigger surface.
+Delegate one explicit packet to the user's configured local review CLI for advisory review while Codex keeps final judgment, file edits, and local verification. The current transport can call the `deepseek` command installed by the third-party Hmbown/DeepSeek-TUI client and pass `deepseek-v4-pro`; that is an unofficial client dependency, not a DeepSeek official agent or trigger surface.
 
 ## Contract
 
 - Use the external CLI only as a bounded helper reviewer, not an authority, owner, trainer, or data collection target.
-- Use `deepseek-v4-pro` for real delegate calls. Do not add cheap-model routing in this helper.
+- Use the configured review CLI as a single external reviewer. Do not add cheap-model routing in this helper.
 - Send only the smallest explicit packet that contains the task, constraints, and evidence.
 - The external CLI receives only `task`, optional `context_text`, contents of listed `context_files`, and helper framing. It does not receive Codex hidden prompts, GPT conversation history, memory, repo files not attached, environment variables, credentials, cookies, or browser/session data.
 - Keep all calls read-only and non-interactive. Do not drive the visual TUI, browser UI, OCR, screenshots, or terminal screen scraping.

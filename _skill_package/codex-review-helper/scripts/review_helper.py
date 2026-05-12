@@ -156,8 +156,11 @@ SENSITIVE_PATTERNS = [
         re.IGNORECASE,
     ),
     re.compile(r"\bauthorization\s*:\s*(bearer|basic)\s+[A-Za-z0-9._~+/\-=]{8,}", re.IGNORECASE),
-    re.compile(r"\b(WEIBO_COOKIE|QQ_SMTP_APP_PASSWORD|DEEPSEEK_API_KEY)\s*=", re.IGNORECASE),
-    re.compile(r"\b(SUB|SUBP|SSOLoginState)=[^;\s]{8,}", re.IGNORECASE),
+    re.compile(
+        r"\b[A-Z0-9_]*(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|PASSWORD|SECRET|COOKIE)[A-Z0-9_]*\s*=",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bcookie\s*:\s*[^;\n]{8,}", re.IGNORECASE),
     re.compile(r'"cookies"\s*:\s*{', re.IGNORECASE),
 ]
 
@@ -242,12 +245,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--provider",
         default="deepseek",
-        help="Provider to pass to the configured CLI before exec.",
+        help=(
+            "Provider id to pass to the configured review CLI before exec. "
+            "The default matches the provider id used by the configured third-party CLI."
+        ),
     )
     parser.add_argument(
         "--model",
         default="deepseek-v4-pro",
-        help="Model to pass to the configured CLI before exec.",
+        help="Model id to pass through to the configured review CLI before exec.",
     )
     parser.add_argument(
         "--sandbox-mode",
@@ -511,7 +517,7 @@ def validate_provider_model(args: argparse.Namespace, parser: argparse.ArgumentP
     if args.provider != "deepseek" and args.model.startswith("deepseek-"):
         argument_error(
             args,
-            "non-deepseek provider requires an explicit compatible --model; "
+            "the configured provider requires an explicit compatible --model; "
             f"got provider={args.provider!r} model={args.model!r}"
         )
 
@@ -667,7 +673,7 @@ Context packet:
 """
 
 
-def deepseek_executable() -> str | None:
+def review_cli_executable() -> str | None:
     if os.name == "nt":
         appdata = os.environ.get("APPDATA")
         if appdata:
@@ -685,8 +691,8 @@ def deepseek_executable() -> str | None:
     return shutil.which("deepseek")
 
 
-def deepseek_command_invocation(command_args: list[str]) -> list[str]:
-    found = deepseek_executable()
+def review_cli_command_invocation(command_args: list[str]) -> list[str]:
+    found = review_cli_executable()
     if not found:
         return ["deepseek", *command_args]
 
@@ -709,7 +715,7 @@ def deepseek_command_invocation(command_args: list[str]) -> list[str]:
     return [found, *command_args]
 
 
-def deepseek_invocation(
+def review_cli_exec_invocation(
     args: argparse.Namespace,
     prompt: str,
     backend_transport: str = "exec-argv",
@@ -736,17 +742,17 @@ def deepseek_invocation(
     else:
         exec_args = ["exec", prompt]
 
-    return deepseek_command_invocation([*common_args, *exec_args])
+    return review_cli_command_invocation([*common_args, *exec_args])
 
 
-def deepseek_mcp_invocation() -> list[str]:
-    return deepseek_command_invocation(["mcp-server"])
+def review_cli_mcp_invocation() -> list[str]:
+    return review_cli_command_invocation(["mcp-server"])
 
 
-def deepseek_exec_supports_transport(backend_transport: str) -> bool:
+def review_cli_exec_supports_transport(backend_transport: str) -> bool:
     if backend_transport == "exec-argv":
         return True
-    invocation = deepseek_command_invocation(["exec", "--help"])
+    invocation = review_cli_command_invocation(["exec", "--help"])
     try:
         result = subprocess.run(
             invocation,
@@ -780,7 +786,7 @@ def resolve_backend_transport(args: argparse.Namespace, driver: str) -> str:
     if requested == "exec-argv":
         return "exec-argv"
     if requested in {"exec-file", "exec-stdin"}:
-        if deepseek_exec_supports_transport(requested):
+        if review_cli_exec_supports_transport(requested):
             return requested
         raise DelegateSetupError(
             f"backend transport {requested} is reserved, but the configured CLI "
@@ -801,7 +807,7 @@ def backend_allows_single_packet(args: argparse.Namespace, prompt: str, backend_
 
 def create_isolated_delegate_cwd() -> tuple[str, str | None]:
     """Create an empty cwd for the downstream CLI so it cannot start inside the repo."""
-    requested_root = os.environ.get("DEEPSEEK_DELEGATE_RUNTIME_DIR")
+    requested_root = os.environ.get("CODEX_REVIEW_HELPER_RUNTIME_DIR")
     roots: list[pathlib.Path] = []
     if requested_root:
         roots.append(pathlib.Path(requested_root).expanduser())
@@ -826,7 +832,7 @@ def cleanup_isolated_delegate_cwd(path: str | None) -> None:
         return
     run_dir = pathlib.Path(path).resolve()
     for root in [
-        os.environ.get("DEEPSEEK_DELEGATE_RUNTIME_DIR"),
+        os.environ.get("CODEX_REVIEW_HELPER_RUNTIME_DIR"),
         str(pathlib.Path(tempfile.gettempdir()) / "codex-review-helper"),
         str(pathlib.Path.cwd() / ".codex-review-helper-runtime"),
     ]:
@@ -909,7 +915,7 @@ def mcp_request(
 
 def start_mcp_server(cwd: str | None) -> subprocess.Popen[str]:
     return subprocess.Popen(
-        deepseek_mcp_invocation(),
+        review_cli_mcp_invocation(),
         cwd=cwd,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -1086,7 +1092,7 @@ def normalize_mcp_delegate_output(args: argparse.Namespace, output: str) -> tupl
     return exit_code, output
 
 
-def call_deepseek_mcp_driver(
+def call_review_cli_mcp_driver(
     args: argparse.Namespace,
     prompt: str,
     cwd: str | None,
@@ -1270,7 +1276,7 @@ def validate_delegate_prompt(
     reject_sensitive_text(prompt, "delegation prompt")
 
 
-def call_deepseek_exec_driver(
+def call_review_cli_exec_driver(
     args: argparse.Namespace,
     prompt: str,
     cwd: str | None,
@@ -1293,7 +1299,7 @@ def call_deepseek_exec_driver(
         elif backend_transport == "exec-stdin":
             run_input = prompt
 
-        invocation = deepseek_invocation(
+        invocation = review_cli_exec_invocation(
             args,
             prompt if backend_transport == "exec-argv" else "",
             backend_transport,
@@ -1326,7 +1332,7 @@ def call_deepseek_exec_driver(
     return result.returncode, output
 
 
-def call_deepseek_with_metadata(
+def call_review_cli_with_metadata(
     args: argparse.Namespace,
     prompt: str,
     cwd: str | None,
@@ -1339,9 +1345,9 @@ def call_deepseek_with_metadata(
     start = time.monotonic()
     warnings: list[str] = []
     if driver == "mcp":
-        code, output = call_deepseek_mcp_driver(args, prompt, cwd, mcp_tool)
+        code, output = call_review_cli_mcp_driver(args, prompt, cwd, mcp_tool)
     else:
-        code, output = call_deepseek_exec_driver(
+        code, output = call_review_cli_exec_driver(
             args,
             prompt,
             cwd,
@@ -1359,13 +1365,13 @@ def call_deepseek_with_metadata(
     }
 
 
-def call_deepseek(
+def call_review_cli(
     args: argparse.Namespace,
     prompt: str,
     cwd: str | None,
     timeout_seconds: int,
 ) -> tuple[int, str]:
-    call = call_deepseek_with_metadata(
+    call = call_review_cli_with_metadata(
         args,
         prompt,
         cwd,
@@ -1624,7 +1630,7 @@ def main() -> int:
 
         args._single_packet_attempted = True
         args._chunk_reason = None
-        call = call_deepseek_with_metadata(
+        call = call_review_cli_with_metadata(
             args,
             prompt,
             delegate_cwd,
@@ -1795,3 +1801,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

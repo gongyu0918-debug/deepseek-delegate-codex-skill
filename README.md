@@ -2,9 +2,9 @@
 
 Single-packet review helper for Codex.
 
-This skill lets Codex ask a configured external CLI for one read-only second opinion on a small review packet. Codex remains the host: it chooses whether to call the helper, verifies every finding locally, and accepts or rejects the result inside the Codex thread.
+This skill lets Codex ask a configured external review CLI for one read-only second opinion on a small review packet. Codex remains the host: it chooses whether to call the helper, verifies every finding locally, and accepts or rejects the result inside the Codex thread.
 
-The current adapter can call the local `deepseek` executable with `deepseek-v4-pro`. The project is not affiliated with DeepSeek, does not provide a model, and does not create a training or evaluation pipeline.
+The current transport is compatible with the `deepseek` command installed by the third-party [Hmbown/DeepSeek-TUI](https://github.com/Hmbown/DeepSeek-TUI) project and passes `deepseek-v4-pro` to that CLI. That dependency is an unofficial client, not a DeepSeek official agent. This repository is not affiliated with DeepSeek, does not provide a model, and does not create a training or evaluation pipeline.
 
 ## Boundaries
 
@@ -49,7 +49,7 @@ This helper cannot control a remote provider's retention policy. For sensitive c
 
 `--cwd` is used by the helper to resolve explicit `context_files`. The downstream CLI process is launched from an isolated temporary directory so it does not start inside the repository.
 
-The helper also passes `--telemetry false`, `--approval-policy never`, and `--sandbox-mode read-only` to the configured CLI. On Windows, CLI sandboxing may be best-effort; do not rely on it for secrets or private repositories.
+When the configured CLI supports the flags, the helper passes `--telemetry false`, `--approval-policy never`, and `--sandbox-mode read-only`. On Windows, CLI sandboxing may be best-effort; do not rely on it for secrets or private repositories.
 
 ## License
 
